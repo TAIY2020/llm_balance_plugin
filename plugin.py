@@ -1,0 +1,698 @@
+"""LLM 平台余额查询插件 — MaiBot SDK v2
+
+通过聊天命令 `/余额` 并行查询 LLM 平台的账号余额，统一汇总输出。
+
+"""
+
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+
+import asyncio
+import html
+import json
+import logging
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+
+logger = logging.getLogger("plugin.llm_balance")
+
+# --- 常量 ---
+
+PLUGIN_VERSION = "1.3.0"
+DEFAULT_TIMEOUT = 10  # 秒
+
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BALANCE_PATH = "/user/balance"
+
+SILICONFLOW_DEFAULT_BASE_URL = "https://api.siliconflow.cn"
+SILICONFLOW_USER_INFO_PATH = "/v1/user/info"
+
+CURRENCY_SYMBOLS = {"CNY": "￥", "USD": "$", "EUR": "€", "JPY": "¥"}
+
+OUTPUT_FORMAT_TEXT = "text"
+OUTPUT_FORMAT_IMAGE = "image"
+OUTPUT_FORMAT_BOTH = "both"
+OUTPUT_FORMATS = (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH)
+
+
+# --- 自定义异常 ---
+
+class _BalanceRequestError(RuntimeError):
+    """网络层异常（连接失败、超时、JSON 解析失败等）。"""
+
+
+class _BalanceHTTPError(RuntimeError):
+    """HTTP 非 2xx 异常，携带状态码与可读详情。"""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+        self.detail = detail
+
+
+class _BalanceBusinessError(RuntimeError):
+    """业务层异常（接口返回 2xx 但 body 表示失败）。"""
+
+
+# --- 配置模型 ---
+
+class PluginSection(PluginConfigBase):
+    """插件基本配置。"""
+
+    __ui_label__ = "插件设置"
+
+    name: str = Field(default="llm_balance_plugin", json_schema_extra={"disabled": True})
+    version: str = Field(default=PLUGIN_VERSION, json_schema_extra={"disabled": True})
+    config_version: str = Field(default=PLUGIN_VERSION, json_schema_extra={"disabled": True})
+    enabled: bool = Field(default=True, description="是否启用插件",
+                          json_schema_extra={"label": "启用插件"})
+
+
+class SettingsSection(PluginConfigBase):
+    """通用设置。"""
+
+    __ui_label__ = "通用设置"
+
+    timeout: int = Field(
+        default=DEFAULT_TIMEOUT,
+        description="单平台请求超时秒数",
+        ge=1, le=60,
+        json_schema_extra={"label": "请求超时（秒）"},
+    )
+    admin_only: bool = Field(
+        default=True,
+        description="是否仅允许管理员使用 /余额 命令",
+        json_schema_extra={"label": "仅管理员可用"},
+    )
+    admin_user_ids: List[str] = Field(
+        default_factory=list,
+        description="允许使用 /余额 命令的用户 QQ 号列表",
+        json_schema_extra={"label": "管理员列表", "hint": "仅 admin_only=true 时生效"},
+    )
+    output_format: Literal["text", "image", "both"] = Field(
+        default=OUTPUT_FORMAT_IMAGE,
+        description='输出格式：text 纯文本 / image HTML 卡片 / both 卡片 + 文本',
+        json_schema_extra={
+            "label": "输出格式",
+            "hint": "text=纯文本；image=HTML 卡片图片；both=卡片+文本（image/both 需要主程序提供 render.html2png 能力）",
+        },
+    )
+
+
+class DeepSeekProviderSection(PluginConfigBase):
+    """DeepSeek 平台配置。"""
+
+    __ui_label__ = "DeepSeek"
+
+    enabled: bool = Field(default=False, json_schema_extra={"label": "启用 DeepSeek"})
+    api_key: str = Field(default="", json_schema_extra={"label": "API Key", "x-widget": "password"})
+    base_url: str = Field(default=DEEPSEEK_DEFAULT_BASE_URL,
+                          json_schema_extra={"label": "API 基地址"})
+
+
+class SiliconFlowProviderSection(PluginConfigBase):
+    """硅基流动平台配置。"""
+
+    __ui_label__ = "SiliconFlow（硅基流动）"
+
+    enabled: bool = Field(default=False, json_schema_extra={"label": "启用硅基流动"})
+    api_key: str = Field(default="", json_schema_extra={"label": "API Key", "x-widget": "password"})
+    base_url: str = Field(default=SILICONFLOW_DEFAULT_BASE_URL,
+                          json_schema_extra={"label": "API 基地址"})
+
+
+class LLMBalanceConfig(PluginConfigBase):
+    """插件完整配置。
+
+    deepseek / siliconflow 提升到顶层 Section，以便 WebUI 正确展开
+    （嵌套两层的 Pydantic Section WebUI 无法渲染，会显示成 [object Object]）。
+    """
+
+    plugin: PluginSection = Field(default_factory=PluginSection)
+    settings: SettingsSection = Field(default_factory=SettingsSection)
+    deepseek: DeepSeekProviderSection = Field(default_factory=DeepSeekProviderSection)
+    siliconflow: SiliconFlowProviderSection = Field(default_factory=SiliconFlowProviderSection)
+
+
+# --- Provider 抽象 ---
+
+class _BalanceProvider:
+    """单个 LLM 平台余额查询的抽象基类。
+
+    子类需要：
+      - 设置 display_name
+      - 覆盖 default_base_url（属性）
+      - 设置 path 或覆盖 _build_url
+      - 实现 to_record(payload) 返回结构化 _BalanceRecord
+    """
+
+    display_name: str = ""
+    path: str = ""
+    user_agent: str = f"MaiBot-LLMBalance/{PLUGIN_VERSION}"
+
+    def __init__(self, api_key: str, base_url: str, timeout: int) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/") or self.default_base_url
+        self.timeout = timeout
+
+    @property
+    def default_base_url(self) -> str:
+        raise NotImplementedError
+
+    def _build_url(self) -> str:
+        return self.base_url + self.path
+
+    def fetch_sync(self) -> Dict[str, Any]:
+        url = self._build_url()
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", self.user_agent)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
+        except urllib.error.URLError as exc:
+            raise _BalanceRequestError(str(exc.reason or exc))
+        except TimeoutError as exc:
+            raise _BalanceRequestError(f"请求超时：{exc}")
+
+        try:
+            return json.loads(body)
+        except ValueError as exc:
+            raise _BalanceRequestError(f"响应不是合法 JSON：{exc}")
+
+    @staticmethod
+    def _extract_http_error_detail(exc: urllib.error.HTTPError) -> str:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            return (exc.reason or "未知错误")[:200]
+        if not raw:
+            return (exc.reason or "未知错误")[:200]
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return raw[:200]
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict):
+                msg = str(err.get("message") or "")
+                if msg:
+                    return msg[:200]
+            msg = str(parsed.get("message") or "")
+            if msg:
+                return msg[:200]
+        return raw[:200]
+
+    def to_record(self, payload: Dict[str, Any]) -> "_BalanceRecord":
+        """把原始响应转换为结构化 _BalanceRecord，由子类实现。"""
+        raise NotImplementedError
+
+    @staticmethod
+    def _format_amount(value: Any) -> str:
+        if value is None:
+            return None  # type: ignore[return-value]
+        try:
+            return f"{float(value):.2f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+
+class _BalanceRecord:
+    """单个平台余额的结构化结果，供文本/HTML 两种输出复用。
+
+    一个 record 可能携带多条 entries（如 DeepSeek 同时返回 CNY/USD）。
+    """
+
+    def __init__(self, display_name: str, status: Optional[str] = None,
+                 status_ok: bool = True,
+                 entries: Optional[List[Dict[str, Optional[str]]]] = None,
+                 note: Optional[str] = None) -> None:
+        self.display_name = display_name
+        self.status = status                    # 已格式化的状态描述
+        self.status_ok = status_ok
+        self.entries = entries or []            # [{currency, total, granted, topped}]
+        self.note = note                        # 额外说明（如解析失败、空响应）
+
+
+# --- 内置 Provider ---
+
+class _DeepSeekProvider(_BalanceProvider):
+    display_name = "DeepSeek"
+    path = DEEPSEEK_BALANCE_PATH
+
+    @property
+    def default_base_url(self) -> str:
+        return DEEPSEEK_DEFAULT_BASE_URL
+
+    def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        is_available = bool(payload.get("is_available", False))
+        infos = payload.get("balance_infos") or []
+        if not isinstance(infos, list):
+            infos = []
+
+        record = _BalanceRecord(
+            display_name=self.display_name,
+            status="可用" if is_available else "不可用（余额不足或被限制）",
+            status_ok=is_available,
+        )
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            currency = str(info.get("currency") or "?").upper()
+            record.entries.append({
+                "currency": currency,
+                "total": self._format_amount(info.get("total_balance")),
+                "granted": self._format_amount(info.get("granted_balance")),
+                "topped": self._format_amount(info.get("topped_up_balance")),
+            })
+        if not record.entries:
+            record.note = "未返回任何币种余额信息"
+        return record
+
+
+class _SiliconFlowProvider(_BalanceProvider):
+    display_name = "硅基流动"
+    path = SILICONFLOW_USER_INFO_PATH
+
+    @property
+    def default_base_url(self) -> str:
+        return SILICONFLOW_DEFAULT_BASE_URL
+
+    def fetch_sync(self) -> Dict[str, Any]:
+        payload = super().fetch_sync()
+        # SiliconFlow 即使 HTTP 200 也可能在 body 里返回业务失败
+        if isinstance(payload, dict) and payload.get("status") is False:
+            msg = str(payload.get("message") or "硅基流动返回业务失败")
+            raise _BalanceBusinessError(msg)
+        return payload
+
+    def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return _BalanceRecord(self.display_name, note="响应缺少 data 字段，无法解析",
+                                   status_ok=False)
+        status = str(data.get("status") or "").lower()
+        return _BalanceRecord(
+            display_name=self.display_name,
+            status="正常" if status == "normal" else (status or "未知"),
+            status_ok=(status == "normal"),
+            note="数据来自官方 API，与控制台显示口径可能略有差异",
+            entries=[{
+                "currency": "CNY",
+                "total": self._format_amount(data.get("totalBalance")),
+                # SiliconFlow API 字段命名反直觉：balance 实际是代金券/赠金，
+                # chargeBalance 才是真正的充值余额。用 labels 把展示标签改为
+                # 跟硅基流动控制台一致的"代金券 / 余额"。
+                "granted": self._format_amount(data.get("balance")),
+                "topped": self._format_amount(data.get("chargeBalance")),
+                "labels": {"granted": "代金券", "topped": "余额"},
+            }],
+        )
+
+
+# --- 主插件类 ---
+
+class LLMBalancePlugin(MaiBotPlugin):
+    """LLM 平台余额查询插件。"""
+
+    config_model = LLMBalanceConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._admin_set: set[str] = set()
+
+    async def on_load(self) -> None:
+        self._refresh_admin_cache()
+        logger.info("LLM 余额查询插件(v%s)初始化完成。", PLUGIN_VERSION)
+
+    async def on_unload(self) -> None:
+        logger.info("LLM 余额查询插件已卸载。")
+
+    async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
+        if scope == "self":
+            self._refresh_admin_cache()
+
+    # ===== 辅助 =====
+
+    def _refresh_admin_cache(self) -> None:
+        self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
+
+    def _check_admin(self, user_id: str) -> bool:
+        return str(user_id) in self._admin_set
+
+    def _collect_providers(self) -> List[_BalanceProvider]:
+        """根据当前配置构造所有 enabled 平台的 Provider 实例。"""
+        settings = self.config.settings
+        result: List[_BalanceProvider] = []
+
+        if self.config.deepseek.enabled and self.config.deepseek.api_key.strip():
+            result.append(_DeepSeekProvider(
+                api_key=self.config.deepseek.api_key.strip(),
+                base_url=self.config.deepseek.base_url.strip(),
+                timeout=settings.timeout,
+            ))
+        if self.config.siliconflow.enabled and self.config.siliconflow.api_key.strip():
+            result.append(_SiliconFlowProvider(
+                api_key=self.config.siliconflow.api_key.strip(),
+                base_url=self.config.siliconflow.base_url.strip(),
+                timeout=settings.timeout,
+            ))
+        return result
+
+    # ===== 命令处理 =====
+
+    @Command(
+        "llm_balance_query",
+        description="查询所有已启用 LLM 平台的账号余额。格式：/余额",
+        pattern=r"^\/余额$",
+    )
+    async def handle_balance(self, stream_id: str = "", group_id: str = "",
+                             user_id: str = "", text: str = "",
+                             plugin_config: Optional[dict] = None, **kwargs):
+        """查询余额：/余额"""
+        if self.config.settings.admin_only and not self._check_admin(user_id):
+            await self.ctx.send.text("❌ 你没有权限查询 LLM 平台余额", stream_id)
+            return False, "用户 %s 无权限" % user_id, True
+
+        providers = self._collect_providers()
+        if not providers:
+            await self.ctx.send.text(
+                "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] 段"
+                "设置 enabled=true 并填入 api_key",
+                stream_id,
+            )
+            return False, "无可用平台", True
+
+        await self.ctx.send.text(
+            f"⏳ 正在并行查询 {len(providers)} 个平台...", stream_id,
+        )
+
+        # 并行查询
+        async def _run(provider: _BalanceProvider) -> Tuple[_BalanceProvider, Any]:
+            try:
+                payload = await asyncio.to_thread(provider.fetch_sync)
+                return provider, payload
+            except Exception as exc:
+                return provider, exc
+
+        results = await asyncio.gather(*[_run(p) for p in providers])
+
+        # 转换为结构化记录（成功项保留 record，失败项保留异常）
+        records: List[Tuple[_BalanceProvider, Any]] = []
+        for provider, payload_or_exc in results:
+            if isinstance(payload_or_exc, Exception):
+                records.append((provider, payload_or_exc))
+                continue
+            try:
+                records.append((provider, provider.to_record(payload_or_exc)))
+            except Exception as exc:
+                logger.error("%s 解析响应失败: %s",
+                             provider.display_name, exc, exc_info=True)
+                records.append((provider, exc))
+
+        # 按 output_format 输出
+        fmt = (self.config.settings.output_format or OUTPUT_FORMAT_TEXT).lower()
+        if fmt not in OUTPUT_FORMATS:
+            fmt = OUTPUT_FORMAT_TEXT
+
+        if fmt in (OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH):
+            try:
+                html_doc = self._render_html_card(records)
+                rendered = await self.ctx.render.html2png(
+                    html_doc,
+                    selector="#card",
+                    viewport={"width": 720, "height": 480},
+                    device_scale_factor=2.0,
+                    full_page=True,
+                )
+                image_b64 = (rendered or {}).get("image_base64")
+                if image_b64:
+                    await self.ctx.send.image(image_b64, stream_id)
+                else:
+                    logger.warning("html2png 未返回 image_base64，回退到文本模式")
+                    fmt = OUTPUT_FORMAT_TEXT
+            except Exception as exc:
+                logger.error("HTML 卡片渲染失败，回退文本模式: %s", exc, exc_info=True)
+                await self.ctx.send.text(
+                    "⚠️ 卡片渲染失败，已回退为文本模式", stream_id,
+                )
+                fmt = OUTPUT_FORMAT_TEXT
+
+        if fmt in (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_BOTH):
+            await self.ctx.send.text(self._format_text_report(records), stream_id)
+
+        return True, "余额查询完成", True
+
+    # ===== 报告组装：文本 =====
+
+    @classmethod
+    def _format_text_report(cls,
+                            records: Sequence[Tuple[_BalanceProvider, Any]]) -> str:
+        """把所有 Provider 的结果（record 或异常）汇总为发送给用户的文本。"""
+        lines: List[str] = ["💰 LLM 平台余额"]
+        for provider, item in records:
+            lines.append("———")
+            lines.append(f"【{provider.display_name}】")
+            error_line = cls._format_error_line(provider, item)
+            if error_line is not None:
+                lines.append(error_line)
+                continue
+            assert isinstance(item, _BalanceRecord)
+            lines.extend(cls._format_record_text_lines(item))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_error_line(provider: _BalanceProvider, item: Any) -> Optional[str]:
+        """识别异常类型并返回单行错误描述；非异常返回 None。"""
+        if isinstance(item, _BalanceHTTPError):
+            logger.warning("%s 查询 HTTP %s: %s",
+                           provider.display_name, item.status, item.detail)
+            if item.status in (401, 403):
+                return "❌ API Key 无效或权限不足"
+            return f"❌ HTTP {item.status}：{item.detail}"
+        if isinstance(item, _BalanceBusinessError):
+            logger.warning("%s 业务失败: %s", provider.display_name, item)
+            return f"❌ 业务失败：{item}"
+        if isinstance(item, _BalanceRequestError):
+            logger.warning("%s 网络异常: %s", provider.display_name, item)
+            return f"❌ 网络错误：{item}"
+        if isinstance(item, Exception):
+            return "❌ 内部错误（详见日志）"
+        return None
+
+    @staticmethod
+    def _format_record_text_lines(record: _BalanceRecord) -> List[str]:
+        lines: List[str] = []
+        if record.status:
+            mark = "✅" if record.status_ok else "⚠️"
+            lines.append(f"状态：{mark} {record.status}")
+        if record.note:
+            lines.append(f"（{record.note}）")
+        for entry in record.entries:
+            currency = entry.get("currency") or "?"
+            symbol = CURRENCY_SYMBOLS.get(currency, "")
+            labels = entry.get("labels") or {}
+            total = entry.get("total")
+            granted = entry.get("granted")
+            topped = entry.get("topped")
+            if total is not None:
+                total_label = labels.get("total") or "总余额"
+                lines.append(f"[{currency}] {total_label}：{symbol}{total}")
+            if granted is not None:
+                granted_label = labels.get("granted") or "赠金余额"
+                lines.append(f"{granted_label}：{symbol}{granted}")
+            if topped is not None:
+                topped_label = labels.get("topped") or "充值余额"
+                lines.append(f"{topped_label}：{symbol}{topped}")
+        return lines
+
+    # ===== 报告组装：HTML 卡片 =====
+
+    @classmethod
+    def _render_html_card(cls,
+                         records: Sequence[Tuple[_BalanceProvider, Any]]) -> str:
+        """把所有平台的结果渲染为单张 HTML 卡片，供 html2png 截图。"""
+        sections: List[str] = []
+        for provider, item in records:
+            sections.append(cls._render_provider_section(provider, item))
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><style>
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: linear-gradient(135deg, #f6f7fb 0%, #e9edf7 100%);
+  padding: 24px;
+  color: #1f2937;
+}}
+#card {{
+  width: 672px;
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 24px 28px;
+  box-shadow: 0 16px 48px -16px rgba(20, 30, 60, 0.18);
+}}
+.card-title {{
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+  letter-spacing: 0.5px;
+}}
+.card-subtitle {{
+  font-size: 13px;
+  color: #6b7280;
+  margin: 0 0 18px 0;
+}}
+.provider {{
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 14px 16px 12px 16px;
+  margin-bottom: 12px;
+  background: #fafbff;
+}}
+.provider:last-child {{ margin-bottom: 0; }}
+.provider-head {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}}
+.provider-name {{
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+}}
+.status-pill {{
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 500;
+}}
+.status-ok    {{ background: #dcfce7; color: #166534; }}
+.status-warn  {{ background: #fee2e2; color: #991b1b; }}
+.status-info  {{ background: #e0e7ff; color: #3730a3; }}
+.entry {{
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px 0 0 0;
+  border-top: 1px dashed #e5e7eb;
+  margin-top: 8px;
+}}
+.entry:first-of-type {{ border-top: 0; margin-top: 0; padding-top: 0; }}
+.entry-cell .label {{
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 2px;
+}}
+.entry-cell .value {{
+  font-size: 16px;
+  font-weight: 600;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+}}
+.entry-cell .value.total {{ color: #2563eb; }}
+.entry-currency {{
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+}}
+.error-text {{
+  color: #991b1b;
+  font-size: 13px;
+  padding: 4px 0;
+}}
+.note-text {{
+  color: #6b7280;
+  font-size: 12px;
+  padding: 2px 0 6px 0;
+}}
+.footer {{
+  text-align: right;
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 16px;
+}}
+</style></head>
+<body>
+<div id="card">
+  <h1 class="card-title">💰 LLM 平台余额</h1>
+  <p class="card-subtitle">共 {len(records)} 个平台</p>
+  {''.join(sections)}
+  <div class="footer">MaiBot · LLM Balance Plugin v{PLUGIN_VERSION}</div>
+</div>
+</body></html>"""
+
+    @classmethod
+    def _render_provider_section(cls, provider: _BalanceProvider, item: Any) -> str:
+        name_esc = html.escape(provider.display_name)
+        error_line = cls._format_error_line(provider, item)
+        if error_line is not None:
+            return (
+                f'<div class="provider">'
+                f'  <div class="provider-head">'
+                f'    <span class="provider-name">{name_esc}</span>'
+                f'    <span class="status-pill status-warn">错误</span>'
+                f'  </div>'
+                f'  <div class="error-text">{html.escape(error_line)}</div>'
+                f'</div>'
+            )
+
+        assert isinstance(item, _BalanceRecord)
+        pill_cls = "status-ok" if item.status_ok else "status-warn"
+        pill_text = html.escape(item.status or ("正常" if item.status_ok else "异常"))
+        note_html = (
+            f'<div class="note-text">{html.escape(item.note)}</div>'
+            if item.note else ""
+        )
+
+        entry_blocks: List[str] = []
+        for entry in item.entries:
+            currency = (entry.get("currency") or "?").upper()
+            symbol = CURRENCY_SYMBOLS.get(currency, "")
+            labels = entry.get("labels") or {}
+            cells: List[str] = []
+            for default_label, key, klass in (
+                ("总余额", "total", "value total"),
+                ("赠金", "granted", "value"),
+                ("充值", "topped", "value"),
+            ):
+                v = entry.get(key)
+                if v is None:
+                    continue
+                label = labels.get(key) or default_label
+                cells.append(
+                    f'<div class="entry-cell">'
+                    f'  <div class="label">{html.escape(label)}</div>'
+                    f'  <div class="{klass}">{html.escape(symbol + str(v))}</div>'
+                    f'</div>'
+                )
+            if not cells:
+                continue
+            entry_blocks.append(
+                f'<div class="entry-currency">{html.escape(currency)}</div>'
+                f'<div class="entry">{"".join(cells)}</div>'
+            )
+
+        entries_html = "".join(entry_blocks) or '<div class="note-text">无可展示的余额条目</div>'
+
+        return (
+            f'<div class="provider">'
+            f'  <div class="provider-head">'
+            f'    <span class="provider-name">{name_esc}</span>'
+            f'    <span class="status-pill {pill_cls}">{pill_text}</span>'
+            f'  </div>'
+            f'  {note_html}'
+            f'  {entries_html}'
+            f'</div>'
+        )
+
+
+def create_plugin() -> LLMBalancePlugin:
+    """创建 LLM 余额查询插件实例。"""
+    return LLMBalancePlugin()
