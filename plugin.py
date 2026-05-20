@@ -4,8 +4,6 @@
 
 """
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
-
 import asyncio
 import html
 import json
@@ -14,11 +12,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
-logger = logging.getLogger("plugin.llm_balance")
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+
+logger = logging.getLogger(__name__)
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 DEFAULT_TIMEOUT = 10  # 秒
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -189,9 +189,9 @@ class _BalanceProvider:
         try:
             raw = exc.read().decode("utf-8", errors="replace")
         except OSError:
-            return (exc.reason or "未知错误")[:200]
+            return str(exc.reason or "未知错误")[:200]
         if not raw:
-            return (exc.reason or "未知错误")[:200]
+            return str(exc.reason or "未知错误")[:200]
         try:
             parsed = json.loads(raw)
         except ValueError:
@@ -212,9 +212,9 @@ class _BalanceProvider:
         raise NotImplementedError
 
     @staticmethod
-    def _format_amount(value: Any) -> str:
+    def _format_amount(value: Any) -> Optional[str]:
         if value is None:
-            return None  # type: ignore[return-value]
+            return None
         try:
             return f"{float(value):.2f}"
         except (TypeError, ValueError):
@@ -376,7 +376,7 @@ class LLMBalancePlugin(MaiBotPlugin):
         """查询余额：/余额"""
         if self.config.settings.admin_only and not self._check_admin(user_id):
             await self.ctx.send.text("❌ 你没有权限查询 LLM 平台余额", stream_id)
-            return False, "用户 %s 无权限" % user_id, True
+            return False, "用户 %s 无权限" % user_id, 1
 
         providers = self._collect_providers()
         if not providers:
@@ -385,7 +385,7 @@ class LLMBalancePlugin(MaiBotPlugin):
                 "设置 enabled=true 并填入 api_key",
                 stream_id,
             )
-            return False, "无可用平台", True
+            return False, "无可用平台", 1
 
         await self.ctx.send.text(
             f"⏳ 正在并行查询 {len(providers)} 个平台...", stream_id,
@@ -420,32 +420,58 @@ class LLMBalancePlugin(MaiBotPlugin):
             fmt = OUTPUT_FORMAT_TEXT
 
         if fmt in (OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH):
+            # 拆三段 try：render_html / html2png / send.image 分别报错，避免发图失败
+            # 时仍提示"卡片渲染失败"误导用户排查方向。
+            image_b64: Optional[str] = None
+            failure_stage: str = ""
+            failure_exc: Optional[Exception] = None
             try:
                 html_doc = self._render_html_card(records)
-                rendered = await self.ctx.render.html2png(
-                    html_doc,
-                    selector="#card",
-                    viewport={"width": 720, "height": 480},
-                    device_scale_factor=2.0,
-                    full_page=True,
-                )
-                image_b64 = (rendered or {}).get("image_base64")
-                if image_b64:
-                    await self.ctx.send.image(image_b64, stream_id)
-                else:
-                    logger.warning("html2png 未返回 image_base64，回退到文本模式")
-                    fmt = OUTPUT_FORMAT_TEXT
             except Exception as exc:
-                logger.error("HTML 卡片渲染失败，回退文本模式: %s", exc, exc_info=True)
-                await self.ctx.send.text(
-                    "⚠️ 卡片渲染失败，已回退为文本模式", stream_id,
-                )
+                failure_stage = "html_compose"
+                failure_exc = exc
+            else:
+                try:
+                    rendered = await self.ctx.render.html2png(
+                        html_doc,
+                        selector="#card",
+                        viewport={"width": 720, "height": 480},
+                        device_scale_factor=2.0,
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    failure_stage = "html2png"
+                    failure_exc = exc
+                else:
+                    image_b64 = (rendered or {}).get("image_base64")
+                    if not image_b64:
+                        failure_stage = "html2png_empty"
+
+            if image_b64:
+                try:
+                    await self.ctx.send.image(image_b64, stream_id)
+                except Exception as exc:
+                    failure_stage = "send_image"
+                    failure_exc = exc
+
+            if failure_stage:
+                stage_msg = {
+                    "html_compose": ("HTML 卡片组装失败", "⚠️ 卡片组装失败，已回退为文本模式"),
+                    "html2png": ("html2png 渲染失败", "⚠️ 卡片渲染失败，已回退为文本模式"),
+                    "html2png_empty": ("html2png 未返回 image_base64", "⚠️ 渲染结果为空，已回退为文本模式"),
+                    "send_image": ("图片发送失败", "⚠️ 图片发送失败，已回退为文本模式"),
+                }[failure_stage]
+                if failure_exc is not None:
+                    logger.error("%s，回退文本模式: %s", stage_msg[0], failure_exc, exc_info=True)
+                else:
+                    logger.warning("%s，回退文本模式", stage_msg[0])
+                await self.ctx.send.text(stage_msg[1], stream_id)
                 fmt = OUTPUT_FORMAT_TEXT
 
         if fmt in (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_BOTH):
             await self.ctx.send.text(self._format_text_report(records), stream_id)
 
-        return True, "余额查询完成", True
+        return True, "余额查询完成", 1
 
     # ===== 报告组装：文本 =====
 

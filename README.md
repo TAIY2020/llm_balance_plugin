@@ -35,8 +35,8 @@
 ```toml
 [plugin]
 name = "llm_balance_plugin"
-version = "1.3.0"
-config_version = "1.3.0"
+version = "1.3.1"
+config_version = "1.3.1"
 enabled = true
 
 [settings]
@@ -59,7 +59,7 @@ base_url = "https://api.siliconflow.cn"
 
 **⚠️ 重要安全提示**（Web UI 同名项）:
 
-- **「管理员列表」**: 允许使用 `.余额` 命令的 QQ 号字符串列表。**默认 `admin_only = true` + 列表为空** 意味着没人能查，需要你自己加上自己的 QQ 号。例如：`["12345", "67890"]`。
+- **「管理员列表」**: 允许使用 `/余额` 命令的 QQ 号字符串列表。**默认 `admin_only = true` + 列表为空** 意味着没人能查，需要你自己加上自己的 QQ 号。例如：`["12345", "67890"]`。
 - **「API Key」**: 各平台的 API Key 是**敏感信息**，建议通过 Web UI 配置（密码框会自动遮挡输入）。不要把带有真实 Key 的 `config.toml` 提交到公开仓库；如果怀疑泄露，请立刻到对应平台后台轮换或撤销该 Key。
 - **「仅管理员可用」**: 默认开启。**强烈建议保留**——这玩意儿会暴露你账号的真实余额，不该让群友能查。
 
