@@ -4,21 +4,39 @@
 
 """
 
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+
 import asyncio
 import html
 import json
 import logging
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
-
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
 logger = logging.getLogger(__name__)
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "1.3.1"
+def _load_manifest_version() -> str:
+    """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
+    try:
+        manifest_path = Path(__file__).parent / "_manifest.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version = data.get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+        logger.warning(
+            "_manifest.json 中 version 字段缺失或非法 (%r)，回落到 0.0.0", version,
+        )
+    except Exception:
+        logger.warning("读取 _manifest.json 失败，回落到 0.0.0", exc_info=True)
+    return "0.0.0"
+
+
+PLUGIN_VERSION = _load_manifest_version()
+CONFIG_SCHEMA_VERSION = "1.4.0"
 DEFAULT_TIMEOUT = 10  # 秒
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -62,8 +80,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "插件设置"
 
     name: str = Field(default="llm_balance_plugin", json_schema_extra={"disabled": True})
-    version: str = Field(default=PLUGIN_VERSION, json_schema_extra={"disabled": True})
-    config_version: str = Field(default=PLUGIN_VERSION, json_schema_extra={"disabled": True})
+    config_version: str = Field(default=CONFIG_SCHEMA_VERSION, json_schema_extra={"disabled": True})
     enabled: bool = Field(default=True, description="是否启用插件",
                           json_schema_extra={"label": "启用插件"})
 
