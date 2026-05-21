@@ -192,9 +192,11 @@ class _BalanceProvider:
         except urllib.error.HTTPError as exc:
             raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
         except urllib.error.URLError as exc:
+            # Python 3.10+ socket.timeout == TimeoutError；urlopen 超时实际抛 URLError(reason=TimeoutError())，
+            # 不会直接进 except TimeoutError——所以从 exc.reason 还原超时语义。
+            if isinstance(exc.reason, TimeoutError):
+                raise _BalanceRequestError(f"请求超时：{exc.reason}")
             raise _BalanceRequestError(str(exc.reason or exc))
-        except TimeoutError as exc:
-            raise _BalanceRequestError(f"请求超时：{exc}")
 
         try:
             return json.loads(body)
@@ -454,7 +456,6 @@ class LLMBalancePlugin(MaiBotPlugin):
                         selector="#card",
                         viewport={"width": 720, "height": 480},
                         device_scale_factor=2.0,
-                        full_page=True,
                     )
                 except Exception as exc:
                     failure_stage = "html2png"
