@@ -364,22 +364,31 @@ class LLMBalancePlugin(MaiBotPlugin):
         return str(user_id) in self._admin_set
 
     def _collect_providers(self) -> List[_BalanceProvider]:
-        """根据当前配置构造所有 enabled 平台的 Provider 实例。"""
+        """根据当前配置构造所有 enabled 平台的 Provider 实例。
+        """
         settings = self.config.settings
         result: List[_BalanceProvider] = []
 
-        if self.config.deepseek.enabled and self.config.deepseek.api_key.strip():
-            result.append(_DeepSeekProvider(
-                api_key=self.config.deepseek.api_key.strip(),
-                base_url=self.config.deepseek.base_url.strip(),
-                timeout=settings.timeout,
-            ))
-        if self.config.siliconflow.enabled and self.config.siliconflow.api_key.strip():
-            result.append(_SiliconFlowProvider(
-                api_key=self.config.siliconflow.api_key.strip(),
-                base_url=self.config.siliconflow.base_url.strip(),
-                timeout=settings.timeout,
-            ))
+        if self.config.deepseek.enabled:
+            api_key = self.config.deepseek.api_key.strip()
+            if api_key:
+                result.append(_DeepSeekProvider(
+                    api_key=api_key,
+                    base_url=self.config.deepseek.base_url.strip(),
+                    timeout=settings.timeout,
+                ))
+            else:
+                logger.warning("DeepSeek 已启用 (enabled=true) 但 api_key 为空，已跳过查询")
+        if self.config.siliconflow.enabled:
+            api_key = self.config.siliconflow.api_key.strip()
+            if api_key:
+                result.append(_SiliconFlowProvider(
+                    api_key=api_key,
+                    base_url=self.config.siliconflow.base_url.strip(),
+                    timeout=settings.timeout,
+                ))
+            else:
+                logger.warning("硅基流动已启用 (enabled=true) 但 api_key 为空，已跳过查询")
         return result
 
     # ===== 命令处理 =====
