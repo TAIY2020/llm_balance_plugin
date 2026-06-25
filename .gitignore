@@ -5,8 +5,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# 本地运行配置
+# 本地运行配置，包含平台 API Key
 config.toml
+config_back/
 
 # 常见本地杂项
 *.log

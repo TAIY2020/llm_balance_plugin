@@ -4,16 +4,23 @@
 
 """
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
-
 import asyncio
+import base64
+import datetime
+import hashlib
+import hmac
 import html
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,7 @@ def _load_manifest_version() -> str:
 
 
 PLUGIN_VERSION = _load_manifest_version()
-CONFIG_SCHEMA_VERSION = "1.4.0"
+CONFIG_SCHEMA_VERSION = "1.5.0"
 DEFAULT_TIMEOUT = 10  # 秒
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -45,12 +52,21 @@ DEEPSEEK_BALANCE_PATH = "/user/balance"
 SILICONFLOW_DEFAULT_BASE_URL = "https://api.siliconflow.cn"
 SILICONFLOW_USER_INFO_PATH = "/v1/user/info"
 
+ALIYUN_DEFAULT_ENDPOINT = "https://business.aliyuncs.com"
+ALIYUN_BSSOPENAPI_VERSION = "2017-12-14"
+ALIYUN_QUERY_ACCOUNT_BALANCE_ACTION = "QueryAccountBalance"
+
 CURRENCY_SYMBOLS = {"CNY": "￥", "USD": "$", "EUR": "€", "JPY": "¥"}
 
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_IMAGE = "image"
 OUTPUT_FORMAT_BOTH = "both"
 OUTPUT_FORMATS = (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH)
+
+MAX_FETCH_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = 0.5
+RETRYABLE_HTTP_STATUSES = (429, 500, 502, 503, 504)
+DEFAULT_PROVIDER_CONCURRENCY = 3
 
 
 # --- 自定义异常 ---
@@ -70,6 +86,41 @@ class _BalanceHTTPError(RuntimeError):
 
 class _BalanceBusinessError(RuntimeError):
     """业务层异常（接口返回 2xx 但 body 表示失败）。"""
+
+
+class _BalanceConfigError(RuntimeError):
+    """插件配置错误（如非 HTTPS API 地址）。"""
+
+
+def _is_retryable_fetch_error(exc: Exception) -> bool:
+    """判断一次余额查询失败是否适合短暂重试。"""
+    if isinstance(exc, _BalanceHTTPError):
+        return exc.status in RETRYABLE_HTTP_STATUSES
+    return isinstance(exc, _BalanceRequestError)
+
+
+async def _fetch_with_retry(provider: "_BalanceProvider") -> Dict[str, Any]:
+    """执行 Provider 查询，并对网络抖动、限流和 5xx 做一次轻量重试。"""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(provider.fetch_sync)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= MAX_FETCH_ATTEMPTS or not _is_retryable_fetch_error(exc):
+                raise
+            delay = RETRY_BACKOFF_SECONDS * attempt
+            logger.info(
+                "%s 查询失败，%.1f 秒后重试（%s/%s）：%s",
+                provider.display_name,
+                delay,
+                attempt + 1,
+                MAX_FETCH_ATTEMPTS,
+                exc,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 # --- 配置模型 ---
@@ -117,7 +168,7 @@ class SettingsSection(PluginConfigBase):
 
 
 class DeepSeekProviderSection(PluginConfigBase):
-    """DeepSeek 平台配置。"""
+    """DeepSeek 平台配置"""
 
     __ui_label__ = "DeepSeek"
 
@@ -128,7 +179,7 @@ class DeepSeekProviderSection(PluginConfigBase):
 
 
 class SiliconFlowProviderSection(PluginConfigBase):
-    """硅基流动平台配置。"""
+    """硅基流动平台配置"""
 
     __ui_label__ = "SiliconFlow（硅基流动）"
 
@@ -136,6 +187,24 @@ class SiliconFlowProviderSection(PluginConfigBase):
     api_key: str = Field(default="", json_schema_extra={"label": "API Key", "x-widget": "password"})
     base_url: str = Field(default=SILICONFLOW_DEFAULT_BASE_URL,
                           json_schema_extra={"label": "API 基地址"})
+
+
+class AliyunProviderSection(PluginConfigBase):
+    """阿里云 BSSOpenAPI 账户余额配置。"""
+
+    __ui_label__ = "阿里云（百炼扣费账户）"
+
+    enabled: bool = Field(default=False, json_schema_extra={"label": "启用阿里云余额"})
+    access_key_id: str = Field(default="", json_schema_extra={"label": "AccessKey ID"})
+    access_key_secret: str = Field(
+        default="",
+        json_schema_extra={"label": "AccessKey Secret", "x-widget": "password"},
+    )
+    endpoint: str = Field(
+        default=ALIYUN_DEFAULT_ENDPOINT,
+        description="阿里云费用中心 BSSOpenAPI Endpoint",
+        json_schema_extra={"label": "Endpoint"},
+    )
 
 
 class LLMBalanceConfig(PluginConfigBase):
@@ -149,6 +218,7 @@ class LLMBalanceConfig(PluginConfigBase):
     settings: SettingsSection = Field(default_factory=SettingsSection)
     deepseek: DeepSeekProviderSection = Field(default_factory=DeepSeekProviderSection)
     siliconflow: SiliconFlowProviderSection = Field(default_factory=SiliconFlowProviderSection)
+    aliyun: AliyunProviderSection = Field(default_factory=AliyunProviderSection)
 
 
 # --- Provider 抽象 ---
@@ -169,15 +239,34 @@ class _BalanceProvider:
 
     def __init__(self, api_key: str, base_url: str, timeout: int) -> None:
         self.api_key = api_key
-        self.base_url = base_url.rstrip("/") or self.default_base_url
+        self.base_url = self._normalize_base_url(base_url)
         self.timeout = timeout
 
     @property
     def default_base_url(self) -> str:
         raise NotImplementedError
 
+    def _normalize_base_url(self, base_url: str) -> str:
+        candidate = (base_url or "").strip().rstrip("/")
+        return candidate or self.default_base_url
+
+    def _require_https_base_url(self) -> str:
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme.lower() != "https":
+            scheme = parsed.scheme or "空"
+            raise _BalanceConfigError(
+                f"{self.display_name} API 基地址必须使用 HTTPS，当前协议：{scheme}",
+            )
+        if not parsed.netloc:
+            raise _BalanceConfigError(f"{self.display_name} API 基地址不是合法 URL")
+        if parsed.username or parsed.password:
+            raise _BalanceConfigError(f"{self.display_name} API 基地址不能包含用户名或密码")
+        if parsed.query or parsed.fragment:
+            raise _BalanceConfigError(f"{self.display_name} API 基地址不能包含查询参数或片段")
+        return self.base_url
+
     def _build_url(self) -> str:
-        return self.base_url + self.path
+        return self._require_https_base_url() + self.path
 
     def fetch_sync(self) -> Dict[str, Any]:
         url = self._build_url()
@@ -235,8 +324,11 @@ class _BalanceProvider:
         if value is None:
             return None
         try:
-            return f"{float(value):.2f}"
-        except (TypeError, ValueError):
+            amount = Decimal(str(value).strip())
+            if not amount.is_finite():
+                return str(value)
+            return format(amount.quantize(Decimal("0.01")), "f")
+        except (InvalidOperation, TypeError, ValueError):
             return str(value)
 
 
@@ -248,12 +340,12 @@ class _BalanceRecord:
 
     def __init__(self, display_name: str, status: Optional[str] = None,
                  status_ok: bool = True,
-                 entries: Optional[List[Dict[str, Optional[str]]]] = None,
+                 entries: Optional[List[Dict[str, Any]]] = None,
                  note: Optional[str] = None) -> None:
         self.display_name = display_name
         self.status = status                    # 已格式化的状态描述
         self.status_ok = status_ok
-        self.entries = entries or []            # [{currency, total, granted, topped}]
+        self.entries = entries or []            # [{currency, total, granted, topped, labels?}]
         self.note = note                        # 额外说明（如解析失败、空响应）
 
 
@@ -333,6 +425,117 @@ class _SiliconFlowProvider(_BalanceProvider):
         )
 
 
+class _AliyunBssOpenApiProvider(_BalanceProvider):
+    """阿里云费用中心余额查询。
+
+    QueryAccountBalance 查询的是账号级余额，可用于判断百炼后付费扣费账户的
+    可用额度，但不等同于百炼免费额度、Token 额度或资源包剩余量。
+    """
+
+    display_name = "阿里百炼"
+
+    def __init__(self, access_key_id: str, access_key_secret: str,
+                 endpoint: str, timeout: int) -> None:
+        super().__init__(api_key=access_key_id, base_url=endpoint, timeout=timeout)
+        self.access_key_secret = access_key_secret
+
+    @property
+    def default_base_url(self) -> str:
+        return ALIYUN_DEFAULT_ENDPOINT
+
+    def fetch_sync(self) -> Dict[str, Any]:
+        base_url = self._require_https_base_url()
+        params: Dict[str, str] = {
+            "Action": ALIYUN_QUERY_ACCOUNT_BALANCE_ACTION,
+            "Version": ALIYUN_BSSOPENAPI_VERSION,
+            "Format": "JSON",
+            "AccessKeyId": self.api_key,
+            "SignatureMethod": "HMAC-SHA1",
+            "SignatureVersion": "1.0",
+            "SignatureNonce": str(uuid.uuid4()),
+            "Timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        params["Signature"] = self._sign(params)
+        url = f"{base_url}/?{self._canonical_query(params)}"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", self.user_agent)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise _BalanceRequestError(f"请求超时：{exc.reason}")
+            raise _BalanceRequestError(str(exc.reason or exc))
+
+        try:
+            payload = json.loads(body)
+        except ValueError as exc:
+            raise _BalanceRequestError(f"响应不是合法 JSON：{exc}")
+
+        if isinstance(payload, dict):
+            code = str(payload.get("Code") or "").strip()
+            success = payload.get("Success")
+            success_text = str(success).strip().lower()
+            data = payload.get("Data")
+
+            if success is False or success_text == "false":
+                message = str(payload.get("Message") or "阿里云返回业务失败")
+                raise _BalanceBusinessError(f"{code}: {message}" if code else message)
+
+            # 阿里云成功响应不总是 Code=200；部分接口会返回 Success/OK，或只返回 Data。
+            success_codes = {"", "200", "success", "ok"}
+            has_success_flag = success is True or success_text == "true"
+            has_balance_data = isinstance(data, dict)
+            if code.lower() not in success_codes and not has_success_flag and not has_balance_data:
+                message = str(payload.get("Message") or "阿里云返回业务失败")
+                raise _BalanceBusinessError(f"{code}: {message}" if code else message)
+        return payload
+
+    def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        data = payload.get("Data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return _BalanceRecord(self.display_name, note="响应缺少 Data 字段，无法解析", status_ok=False)
+
+        currency = str(data.get("Currency") or "CNY").upper()
+        note = "账号级余额；可判断百炼后付费扣费账户可用额度，不代表百炼免费额度/Token/资源包剩余"
+
+        return _BalanceRecord(
+            display_name=self.display_name,
+            status="正常",
+            status_ok=True,
+            note=note,
+            entries=[{
+                "currency": currency,
+                "total": self._format_amount(data.get("AvailableAmount")),
+                "granted": self._format_amount(data.get("CreditAmount")),
+                "topped": self._format_amount(data.get("AvailableCashAmount")),
+                "labels": {"total": "可用额度", "granted": "信控额度", "topped": "现金余额"},
+            }],
+        )
+
+    def _sign(self, params: Dict[str, str]) -> str:
+        canonical = self._canonical_query(params)
+        string_to_sign = f"GET&%2F&{self._percent_encode(canonical)}"
+        key = f"{self.access_key_secret}&".encode("utf-8")
+        digest = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha1).digest()
+        return base64.b64encode(digest).decode("utf-8")
+
+    @classmethod
+    def _canonical_query(cls, params: Dict[str, str]) -> str:
+        return "&".join(
+            f"{cls._percent_encode(key)}={cls._percent_encode(value)}"
+            for key, value in sorted(params.items())
+        )
+
+    @staticmethod
+    def _percent_encode(value: Any) -> str:
+        return urllib.parse.quote(str(value), safe="~")
+
+
 # --- 主插件类 ---
 
 class LLMBalancePlugin(MaiBotPlugin):
@@ -351,9 +554,16 @@ class LLMBalancePlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         logger.info("LLM 余额查询插件已卸载。")
 
-    async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
-        if scope == "self":
+    async def on_config_update(
+        self,
+        scope: str,
+        config_data: dict[str, object],
+        version: str,
+    ) -> None:
+        if scope == CONFIG_RELOAD_SCOPE_SELF:
             self._refresh_admin_cache()
+            self.ctx.logger.info("LLM 余额插件配置已更新: version=%s", version)
+        del config_data
 
     # ===== 辅助 =====
 
@@ -362,6 +572,14 @@ class LLMBalancePlugin(MaiBotPlugin):
 
     def _check_admin(self, user_id: str) -> bool:
         return str(user_id) in self._admin_set
+
+    @staticmethod
+    def _capability_error_message(result: Any) -> Optional[str]:
+        """兼容部分能力调用以返回值而不是异常表达失败的情况。"""
+        if isinstance(result, dict) and result.get("success") is False:
+            error = result.get("error") or result.get("message")
+            return str(error or "能力调用返回 success=false")
+        return None
 
     def _collect_providers(self) -> List[_BalanceProvider]:
         """根据当前配置构造所有 enabled 平台的 Provider 实例。
@@ -389,6 +607,18 @@ class LLMBalancePlugin(MaiBotPlugin):
                 ))
             else:
                 logger.warning("硅基流动已启用 (enabled=true) 但 api_key 为空，已跳过查询")
+        if self.config.aliyun.enabled:
+            access_key_id = self.config.aliyun.access_key_id.strip()
+            access_key_secret = self.config.aliyun.access_key_secret.strip()
+            if access_key_id and access_key_secret:
+                result.append(_AliyunBssOpenApiProvider(
+                    access_key_id=access_key_id,
+                    access_key_secret=access_key_secret,
+                    endpoint=self.config.aliyun.endpoint.strip(),
+                    timeout=settings.timeout,
+                ))
+            else:
+                logger.warning("阿里云已启用 (enabled=true) 但 AccessKey 配置不完整，已跳过查询")
         return result
 
     # ===== 命令处理 =====
@@ -409,8 +639,8 @@ class LLMBalancePlugin(MaiBotPlugin):
         providers = self._collect_providers()
         if not providers:
             await self.ctx.send.text(
-                "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] 段"
-                "设置 enabled=true 并填入 api_key",
+                "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] / [aliyun] 段"
+                "设置 enabled=true 并填入对应凭证",
                 stream_id,
             )
             return False, "无可用平台", 1
@@ -419,10 +649,15 @@ class LLMBalancePlugin(MaiBotPlugin):
             f"⏳ 正在并行查询 {len(providers)} 个平台...", stream_id,
         )
 
-        # 并行查询
+        # 并行查询；阻塞式 urllib 放进线程池时限制并发，避免多平台扩展后压垮默认线程池。
+        fetch_semaphore = asyncio.Semaphore(
+            max(1, min(DEFAULT_PROVIDER_CONCURRENCY, len(providers))),
+        )
+
         async def _run(provider: _BalanceProvider) -> Tuple[_BalanceProvider, Any]:
             try:
-                payload = await asyncio.to_thread(provider.fetch_sync)
+                async with fetch_semaphore:
+                    payload = await _fetch_with_retry(provider)
                 return provider, payload
             except Exception as exc:
                 return provider, exc
@@ -438,14 +673,15 @@ class LLMBalancePlugin(MaiBotPlugin):
             try:
                 records.append((provider, provider.to_record(payload_or_exc)))
             except Exception as exc:
-                logger.error("%s 解析响应失败: %s",
-                             provider.display_name, exc, exc_info=True)
                 records.append((provider, exc))
+
+        self._log_provider_errors(records)
 
         # 按 output_format 输出
         fmt = (self.config.settings.output_format or OUTPUT_FORMAT_TEXT).lower()
         if fmt not in OUTPUT_FORMATS:
             fmt = OUTPUT_FORMAT_TEXT
+        render_fallback_notice: Optional[str] = None
 
         if fmt in (OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH):
             # 拆三段 try：render_html / html2png / send.image 分别报错，避免发图失败
@@ -462,41 +698,55 @@ class LLMBalancePlugin(MaiBotPlugin):
                 try:
                     rendered = await self.ctx.render.html2png(
                         html_doc,
-                        selector="#card",
-                        viewport={"width": 720, "height": 480},
+                        selector="body",
+                        viewport={"width": 720, "height": self._estimate_card_viewport_height(records)},
                         device_scale_factor=2.0,
+                        full_page=True,
+                        render_timeout_ms=max(1, self.config.settings.timeout) * 1000,
                     )
                 except Exception as exc:
                     failure_stage = "html2png"
                     failure_exc = exc
                 else:
-                    image_b64 = (rendered or {}).get("image_base64")
-                    if not image_b64:
+                    if isinstance(rendered, dict):
+                        render_error = self._capability_error_message(rendered)
+                        if render_error:
+                            failure_stage = "html2png"
+                            failure_exc = RuntimeError(render_error)
+                        else:
+                            image_b64 = rendered.get("image_base64")
+                    if not image_b64 and not failure_stage:
                         failure_stage = "html2png_empty"
 
             if image_b64:
                 try:
-                    await self.ctx.send.image(image_b64, stream_id)
+                    send_result = await self.ctx.send.image(image_b64, stream_id)
+                    send_error = self._capability_error_message(send_result)
+                    if send_error:
+                        raise RuntimeError(send_error)
                 except Exception as exc:
                     failure_stage = "send_image"
                     failure_exc = exc
 
             if failure_stage:
                 stage_msg = {
-                    "html_compose": ("HTML 卡片组装失败", "⚠️ 卡片组装失败，已回退为文本模式"),
-                    "html2png": ("html2png 渲染失败", "⚠️ 卡片渲染失败，已回退为文本模式"),
-                    "html2png_empty": ("html2png 未返回 image_base64", "⚠️ 渲染结果为空，已回退为文本模式"),
-                    "send_image": ("图片发送失败", "⚠️ 图片发送失败，已回退为文本模式"),
+                    "html_compose": ("HTML 卡片组装失败", "⚠️ 卡片组装失败，已自动切换为文本。"),
+                    "html2png": ("html2png 渲染失败", "⚠️ 卡片渲染失败，已自动切换为文本。"),
+                    "html2png_empty": ("html2png 未返回 image_base64", "⚠️ 渲染结果为空，已自动切换为文本。"),
+                    "send_image": ("图片发送失败", "⚠️ 图片发送失败，已自动切换为文本。"),
                 }[failure_stage]
                 if failure_exc is not None:
                     logger.error("%s，回退文本模式: %s", stage_msg[0], failure_exc, exc_info=True)
                 else:
                     logger.warning("%s，回退文本模式", stage_msg[0])
-                await self.ctx.send.text(stage_msg[1], stream_id)
+                render_fallback_notice = stage_msg[1]
                 fmt = OUTPUT_FORMAT_TEXT
 
         if fmt in (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_BOTH):
-            await self.ctx.send.text(self._format_text_report(records), stream_id)
+            report = self._format_text_report(records)
+            if render_fallback_notice:
+                report = f"{render_fallback_notice}\n\n{report}"
+            await self.ctx.send.text(report, stream_id)
 
         return True, "余额查询完成", 1
 
@@ -519,20 +769,39 @@ class LLMBalancePlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     @staticmethod
+    def _log_provider_errors(records: Sequence[Tuple[_BalanceProvider, Any]]) -> None:
+        """集中记录 Provider 异常，避免文本和 HTML 两种输出重复打日志。"""
+        for provider, item in records:
+            if isinstance(item, _BalanceHTTPError):
+                logger.warning("%s 查询 HTTP %s: %s",
+                               provider.display_name, item.status, item.detail)
+            elif isinstance(item, _BalanceBusinessError):
+                logger.warning("%s 业务失败: %s", provider.display_name, item)
+            elif isinstance(item, _BalanceRequestError):
+                logger.warning("%s 网络异常: %s", provider.display_name, item)
+            elif isinstance(item, _BalanceConfigError):
+                logger.warning("%s 配置错误: %s", provider.display_name, item)
+            elif isinstance(item, Exception):
+                logger.error(
+                    "%s 查询或解析失败: %s",
+                    provider.display_name,
+                    item,
+                    exc_info=(type(item), item, item.__traceback__),
+                )
+
+    @staticmethod
     def _format_error_line(provider: _BalanceProvider, item: Any) -> Optional[str]:
         """识别异常类型并返回单行错误描述；非异常返回 None。"""
         if isinstance(item, _BalanceHTTPError):
-            logger.warning("%s 查询 HTTP %s: %s",
-                           provider.display_name, item.status, item.detail)
             if item.status in (401, 403):
                 return "❌ API Key 无效或权限不足"
             return f"❌ HTTP {item.status}：{item.detail}"
         if isinstance(item, _BalanceBusinessError):
-            logger.warning("%s 业务失败: %s", provider.display_name, item)
             return f"❌ 业务失败：{item}"
         if isinstance(item, _BalanceRequestError):
-            logger.warning("%s 网络异常: %s", provider.display_name, item)
             return f"❌ 网络错误：{item}"
+        if isinstance(item, _BalanceConfigError):
+            return f"❌ 配置错误：{item}"
         if isinstance(item, Exception):
             return "❌ 内部错误（详见日志）"
         return None
@@ -564,6 +833,21 @@ class LLMBalancePlugin(MaiBotPlugin):
         return lines
 
     # ===== 报告组装：HTML 卡片 =====
+
+    @classmethod
+    def _estimate_card_viewport_height(cls,
+                                       records: Sequence[Tuple[_BalanceProvider, Any]]) -> int:
+        """估算初始视口高度；实际截图仍使用 full_page，避免卡片内容被裁切。"""
+        height = 160
+        for _, item in records:
+            height += 86
+            if isinstance(item, _BalanceRecord):
+                if item.note:
+                    height += 24
+                height += max(1, len(item.entries)) * 64
+            else:
+                height += 32
+        return min(max(height, 480), 2400)
 
     @classmethod
     def _render_html_card(cls,
