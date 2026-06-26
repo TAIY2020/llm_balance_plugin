@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.6.0",
+  "version": "1.6.1",
   "name": "LLM 平台余额查询插件 | LLM Balance Plugin",
   "description": "通过聊天命令 /余额 并行查询 DeepSeek、SiliconFlow 和阿里云账号余额，支持 HTML 卡片可视化输出，仅依赖 Python 标准库。",
   "author": {
