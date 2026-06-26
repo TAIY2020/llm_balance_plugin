@@ -367,7 +367,7 @@ class _DeepSeekProvider(_BalanceProvider):
 
         record = _BalanceRecord(
             display_name=self.display_name,
-            status="可用" if is_available else "不可用（余额不足或被限制）",
+            status="正常" if is_available else "异常（余额不足或被限制）",
             status_ok=is_available,
         )
         for info in infos:
