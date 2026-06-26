@@ -69,6 +69,26 @@ RETRYABLE_HTTP_STATUSES = (429, 500, 502, 503, 504)
 DEFAULT_PROVIDER_CONCURRENCY = 3
 
 
+# --- 网络层 ---
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止跟随 3xx 重定向的 handler。
+
+    余额请求会带着 `Authorization: Bearer <api_key>` 头。urllib 默认会自动跟随
+    重定向——若端点（尤其是用户自建网关/代理）返回 302 跳到第三方或降级到
+    http://，凭证就会被原样转发给重定向目标，造成泄露。这里让 redirect_request
+    返回 None，urllib 便不再构造跟随请求，3xx 会落到默认错误处理器抛
+    HTTPError，由上层统一当作 HTTP 错误展示，既不泄露 key 也不会静默。
+    """
+
+    def redirect_request(self, *args, **kwargs):  # type: ignore[override]
+        return None
+
+
+# 携带敏感凭证的请求统一走这个不跟随重定向的 opener。
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
 # --- 自定义异常 ---
 
 class _BalanceRequestError(RuntimeError):
@@ -276,7 +296,7 @@ class _BalanceProvider:
         req.add_header("User-Agent", self.user_agent)
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
@@ -462,7 +482,7 @@ class _AliyunBssOpenApiProvider(_BalanceProvider):
         req.add_header("User-Agent", self.user_agent)
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
@@ -575,17 +595,30 @@ class LLMBalancePlugin(MaiBotPlugin):
 
     @staticmethod
     def _capability_error_message(result: Any) -> Optional[str]:
-        """兼容部分能力调用以返回值而不是异常表达失败的情况。"""
+        """兼容部分能力调用以返回值(bool 或 dict)而不是异常表达失败的情况。
+
+        send.* 系列经 SDK 归一化后返回 bool（失败为 False）；render.html2png 等
+        多字段能力在失败时返回带 success=False 的 dict。两种都要能识破，否则会把
+        "发送/渲染失败"误判为成功——例如 image 模式下发图失败时静默吞掉结果。
+        """
+        if result is False:
+            return "能力调用返回失败(success=false)"
         if isinstance(result, dict) and result.get("success") is False:
             error = result.get("error") or result.get("message")
             return str(error or "能力调用返回 success=false")
         return None
 
-    def _collect_providers(self) -> List[_BalanceProvider]:
+    def _collect_providers(self) -> Tuple[List[_BalanceProvider], List[str]]:
         """根据当前配置构造所有 enabled 平台的 Provider 实例。
+
+        Returns:
+            (providers, skipped_notes)：providers 为可查询的 Provider 列表；
+            skipped_notes 为"已启用但凭证不完整、已跳过"的平台提示，用于在结果里
+            明确告知用户，而不是只写进日志后静默消失。
         """
         settings = self.config.settings
         result: List[_BalanceProvider] = []
+        skipped: List[str] = []
 
         if self.config.deepseek.enabled:
             api_key = self.config.deepseek.api_key.strip()
@@ -597,6 +630,7 @@ class LLMBalancePlugin(MaiBotPlugin):
                 ))
             else:
                 logger.warning("DeepSeek 已启用 (enabled=true) 但 api_key 为空，已跳过查询")
+                skipped.append("DeepSeek：已启用但未配置 API Key")
         if self.config.siliconflow.enabled:
             api_key = self.config.siliconflow.api_key.strip()
             if api_key:
@@ -607,6 +641,7 @@ class LLMBalancePlugin(MaiBotPlugin):
                 ))
             else:
                 logger.warning("硅基流动已启用 (enabled=true) 但 api_key 为空，已跳过查询")
+                skipped.append("硅基流动：已启用但未配置 API Key")
         if self.config.aliyun.enabled:
             access_key_id = self.config.aliyun.access_key_id.strip()
             access_key_secret = self.config.aliyun.access_key_secret.strip()
@@ -619,7 +654,8 @@ class LLMBalancePlugin(MaiBotPlugin):
                 ))
             else:
                 logger.warning("阿里云已启用 (enabled=true) 但 AccessKey 配置不完整，已跳过查询")
-        return result
+                skipped.append("阿里百炼：已启用但 AccessKey ID/Secret 不完整")
+        return result, skipped
 
     # ===== 命令处理 =====
 
@@ -633,11 +669,29 @@ class LLMBalancePlugin(MaiBotPlugin):
                              plugin_config: Optional[dict] = None, **kwargs):
         """查询余额：/余额"""
         if self.config.settings.admin_only and not self._check_admin(user_id):
-            await self.ctx.send.text("❌ 你没有权限查询 LLM 平台余额", stream_id)
+            if not self._admin_set:
+                # admin_only=true 但没人配进白名单 → 所有人(含部署者自己)都被拒。
+                # 这种"全员拒绝"最容易让人摸不着头脑，给出针对性引导而非笼统提示。
+                deny_msg = (
+                    "❌ 『仅管理员可用』已开启，但管理员列表为空，当前没有人能查询。\n"
+                    "请在配置 [settings].admin_user_ids 中加入你的 QQ 号，或把 admin_only 关掉。"
+                )
+            else:
+                deny_msg = "❌ 你没有权限查询 LLM 平台余额"
+            await self.ctx.send.text(deny_msg, stream_id)
             return False, "用户 %s 无权限" % user_id, 1
 
-        providers = self._collect_providers()
+        providers, skipped_notes = self._collect_providers()
         if not providers:
+            if skipped_notes:
+                # 平台都 enabled 了，只是凭证没填全：给出针对性的缺失清单，
+                # 而不是笼统的"未启用任何平台"，方便用户直接定位要补哪个凭证。
+                detail = "\n".join(f"· {note}" for note in skipped_notes)
+                await self.ctx.send.text(
+                    "❌ 已启用的平台都没有配置完整凭证，无法查询：\n" + detail,
+                    stream_id,
+                )
+                return False, "启用的平台凭证不完整", 1
             await self.ctx.send.text(
                 "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] / [aliyun] 段"
                 "设置 enabled=true 并填入对应凭证",
@@ -690,7 +744,7 @@ class LLMBalancePlugin(MaiBotPlugin):
             failure_stage: str = ""
             failure_exc: Optional[Exception] = None
             try:
-                html_doc = self._render_html_card(records)
+                html_doc = self._render_html_card(records, skipped_notes)
             except Exception as exc:
                 failure_stage = "html_compose"
                 failure_exc = exc
@@ -743,10 +797,14 @@ class LLMBalancePlugin(MaiBotPlugin):
                 fmt = OUTPUT_FORMAT_TEXT
 
         if fmt in (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_BOTH):
-            report = self._format_text_report(records)
+            report = self._format_text_report(records, skipped_notes)
             if render_fallback_notice:
                 report = f"{render_fallback_notice}\n\n{report}"
-            await self.ctx.send.text(report, stream_id)
+            send_result = await self.ctx.send.text(report, stream_id)
+            text_error = self._capability_error_message(send_result)
+            if text_error:
+                logger.error("余额文本报告发送失败：%s", text_error)
+                return False, "文本报告发送失败：%s" % text_error, 1
 
         return True, "余额查询完成", 1
 
@@ -754,7 +812,8 @@ class LLMBalancePlugin(MaiBotPlugin):
 
     @classmethod
     def _format_text_report(cls,
-                            records: Sequence[Tuple[_BalanceProvider, Any]]) -> str:
+                            records: Sequence[Tuple[_BalanceProvider, Any]],
+                            skipped_notes: Sequence[str] = ()) -> str:
         """把所有 Provider 的结果（record 或异常）汇总为发送给用户的文本。"""
         lines: List[str] = ["💰 LLM 平台余额"]
         for provider, item in records:
@@ -766,6 +825,9 @@ class LLMBalancePlugin(MaiBotPlugin):
                 continue
             assert isinstance(item, _BalanceRecord)
             lines.extend(cls._format_record_text_lines(item))
+        for note in skipped_notes:
+            lines.append("———")
+            lines.append(f"⚠️ {note}")
         return "\n".join(lines)
 
     @staticmethod
@@ -851,11 +913,22 @@ class LLMBalancePlugin(MaiBotPlugin):
 
     @classmethod
     def _render_html_card(cls,
-                         records: Sequence[Tuple[_BalanceProvider, Any]]) -> str:
+                         records: Sequence[Tuple[_BalanceProvider, Any]],
+                         skipped_notes: Sequence[str] = ()) -> str:
         """把所有平台的结果渲染为单张 HTML 卡片，供 html2png 截图。"""
         sections: List[str] = []
         for provider, item in records:
             sections.append(cls._render_provider_section(provider, item))
+        for note in skipped_notes:
+            sections.append(
+                f'<div class="provider">'
+                f'  <div class="provider-head">'
+                f'    <span class="provider-name">⚠️ 已跳过</span>'
+                f'    <span class="status-pill status-warn">未配置</span>'
+                f'  </div>'
+                f'  <div class="error-text">{html.escape(note)}</div>'
+                f'</div>'
+            )
         return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>
 * {{ box-sizing: border-box; }}
