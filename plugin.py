@@ -51,12 +51,31 @@ DEEPSEEK_BALANCE_PATH = "/user/balance"
 
 SILICONFLOW_DEFAULT_BASE_URL = "https://api.siliconflow.cn"
 SILICONFLOW_USER_INFO_PATH = "/v1/user/info"
+# 硅基流动已停止通过 API 提供余额：/v1/user/info 仍然存在且鉴权正常（官方 OpenAPI
+# 至今仍标 deprecated: false、示例仍写 balance="0.88"），但实际返回的
+# balance / chargeBalance / totalBalance 恒为 "0"、status 恒为空串。已向官方提工单
+# 确认：旧余额查询接口不可用，且没有替代接口——全站 API Reference 里账户类端点
+# 有且仅有这一个，优惠券余额也没有任何查询入口。
+# 这是 2025-06-11 起把 name / image / email 固定成空串那批脱敏改动的延续，
+# 平台未就余额字段单独发公告。
+SILICONFLOW_BALANCE_UNAVAILABLE_NOTE = (
+    "硅基流动已停止通过 API 提供余额数据（官方确认无替代接口），请到控制台查看余额"
+)
 
 ALIYUN_DEFAULT_ENDPOINT = "https://business.aliyuncs.com"
 ALIYUN_BSSOPENAPI_VERSION = "2017-12-14"
 ALIYUN_QUERY_ACCOUNT_BALANCE_ACTION = "QueryAccountBalance"
 
 CURRENCY_SYMBOLS = {"CNY": "￥", "USD": "$", "EUR": "€", "JPY": "¥"}
+
+# 状态档位 → 文本前缀 / HTML 徽标配色。info 档用于"请求成功但平台不给数据"，
+# 既不该标绿说正常，也不该标红让人以为账户出了问题。
+STATUS_LEVEL_MARKS = {"ok": "✅", "warn": "⚠️", "info": "ℹ️"}
+STATUS_LEVEL_PILL_CLASSES = {
+    "ok": "status-ok",
+    "warn": "status-warn",
+    "info": "status-info",
+}
 
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_IMAGE = "image"
@@ -361,10 +380,15 @@ class _BalanceRecord:
     def __init__(self, display_name: str, status: Optional[str] = None,
                  status_ok: bool = True,
                  entries: Optional[List[Dict[str, Any]]] = None,
-                 note: Optional[str] = None) -> None:
+                 note: Optional[str] = None,
+                 status_level: Optional[str] = None) -> None:
         self.display_name = display_name
         self.status = status                    # 已格式化的状态描述
         self.status_ok = status_ok
+        # ok / warn / info 三档，决定徽标配色与文本前缀。留空时按 status_ok 推导，
+        # 既有 Provider 行为不变；info 表示"请求没失败、但平台就是不给数据"这类
+        # 中间态——用红色告警会让人误以为账户欠费，用绿色又谎称一切正常。
+        self.status_level = status_level or ("ok" if status_ok else "warn")
         self.entries = entries or []            # [{currency, total, granted, topped, labels?}]
         self.note = note                        # 额外说明（如解析失败、空响应）
 
@@ -426,23 +450,63 @@ class _SiliconFlowProvider(_BalanceProvider):
         if not isinstance(data, dict):
             return _BalanceRecord(self.display_name, note="响应缺少 data 字段，无法解析",
                                    status_ok=False)
+
+        total = self._format_amount(data.get("totalBalance"))
+        granted = self._format_amount(data.get("balance"))
+        topped = self._format_amount(data.get("chargeBalance"))
+
+        # 三项金额全为 0/缺失 = 平台已停供余额数据（详见 SILICONFLOW_BALANCE_UNAVAILABLE_NOTE）。
+        # 这里不硬编码"永远不显示金额"，而是按返回值判断：万一平台日后恢复，任一项
+        # 非零即自动回到正常展示，不必改代码。代价是真·零余额账户也会走到这个分支，
+        # 但既然接口恒返回 0，那个分支本就无法与之区分，且给出的引导（去控制台看）
+        # 对两种情况都成立。
+        if self._is_zero(total) and self._is_zero(granted) and self._is_zero(topped):
+            return _BalanceRecord(
+                display_name=self.display_name,
+                status="接口受限",
+                status_ok=True,
+                status_level="info",
+                note=SILICONFLOW_BALANCE_UNAVAILABLE_NOTE,
+            )
+
         status = str(data.get("status") or "").lower()
+        if status == "normal":
+            status_text, status_ok, status_level = "正常", True, "ok"
+        elif not status:
+            # status 现在恒为空串（文档示例仍是 normal）。空串是平台不再下发该字段，
+            # 不是账户异常——旧代码把它判成"未知 + 红色告警"，会误导用户排查欠费。
+            status_text, status_ok, status_level = "状态未提供", True, "info"
+        else:
+            status_text, status_ok, status_level = status, False, "warn"
+
         return _BalanceRecord(
             display_name=self.display_name,
-            status="正常" if status == "normal" else (status or "未知"),
-            status_ok=(status == "normal"),
+            status=status_text,
+            status_ok=status_ok,
+            status_level=status_level,
             note="数据来自官方 API，与控制台显示口径可能略有差异",
             entries=[{
                 "currency": "CNY",
-                "total": self._format_amount(data.get("totalBalance")),
-                # SiliconFlow API 字段命名反直觉：balance 实际是代金券/赠金，
-                # chargeBalance 才是真正的充值余额。用 labels 把展示标签改为
-                # 跟硅基流动控制台一致的"代金券 / 余额"。
-                "granted": self._format_amount(data.get("balance")),
-                "topped": self._format_amount(data.get("chargeBalance")),
-                "labels": {"granted": "代金券", "topped": "余额"},
+                "total": total,
+                # SiliconFlow API 字段命名反直觉：balance 是赠送余额，chargeBalance
+                # 才是真正的充值余额。注意 2026-03-26 起赠送余额已整体迁移为"优惠券"
+                # 独立体系，balance 即便恢复下发也多半为 0，优惠券无任何查询接口。
+                "granted": granted,
+                "topped": topped,
+                "labels": {"granted": "赠送余额", "topped": "充值余额"},
             }],
         )
+
+    @staticmethod
+    def _is_zero(amount: Optional[str]) -> bool:
+        """判断 _format_amount 的结果是否为 0 或缺失。"""
+        if amount is None:
+            return True
+        try:
+            return Decimal(amount) == 0
+        except (InvalidOperation, TypeError, ValueError):
+            # 解析不出来说明是平台返回了非数值内容，那就不是"零余额"，照常展示。
+            return False
 
 
 class _AliyunBssOpenApiProvider(_BalanceProvider):
@@ -872,7 +936,7 @@ class LLMBalancePlugin(MaiBotPlugin):
     def _format_record_text_lines(record: _BalanceRecord) -> List[str]:
         lines: List[str] = []
         if record.status:
-            mark = "✅" if record.status_ok else "⚠️"
+            mark = STATUS_LEVEL_MARKS.get(record.status_level, "⚠️")
             lines.append(f"状态：{mark} {record.status}")
         if record.note:
             lines.append(f"（{record.note}）")
@@ -1054,7 +1118,7 @@ body {{
             )
 
         assert isinstance(item, _BalanceRecord)
-        pill_cls = "status-ok" if item.status_ok else "status-warn"
+        pill_cls = STATUS_LEVEL_PILL_CLASSES.get(item.status_level, "status-warn")
         pill_text = html.escape(item.status or ("正常" if item.status_ok else "异常"))
         note_html = (
             f'<div class="note-text">{html.escape(item.note)}</div>'
@@ -1089,7 +1153,10 @@ body {{
                 f'<div class="entry">{"".join(cells)}</div>'
             )
 
-        entries_html = "".join(entry_blocks) or '<div class="note-text">无可展示的余额条目</div>'
+        entries_html = "".join(entry_blocks)
+        if not entries_html and not item.note:
+            # note 已经在上面渲染过了，有 note 时再补一句"无可展示的余额条目"纯属噪音。
+            entries_html = '<div class="note-text">无可展示的余额条目</div>'
 
         return (
             f'<div class="provider">'
