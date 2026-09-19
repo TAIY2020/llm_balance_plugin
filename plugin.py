@@ -10,6 +10,7 @@ import datetime
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import logging
 import urllib.error
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase
+from pydantic import field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,10 @@ def _load_manifest_version() -> str:
 PLUGIN_VERSION = _load_manifest_version()
 CONFIG_SCHEMA_VERSION = "1.5.0"
 DEFAULT_TIMEOUT = 10  # 秒
+MAX_TIMEOUT = 60  # 秒，settings.timeout 的上限，须与 SettingsSection.timeout 的 le 保持一致
+# 单次响应体上限。余额接口的 JSON 只有几百字节，1 MiB 足够宽裕；超过说明端点被换成了
+# 别的东西（网关错误页、被劫持），不该无限读下去占着线程。
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_BALANCE_PATH = "/user/balance"
@@ -85,7 +91,21 @@ OUTPUT_FORMATS = (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH)
 MAX_FETCH_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.5
 RETRYABLE_HTTP_STATUSES = (429, 500, 502, 503, 504)
+# 插件实例级并发上限：跨命令共享，而不是每条 /余额 各开一份。
 DEFAULT_PROVIDER_CONCURRENCY = 3
+
+# html2png 业务超时上限。Host 侧 cap.call 的 RPC 默认超时是 30 秒，渲染业务超时若
+# 设得比它还长，RPC 会先超时抛错，渲染必然失败回退文本——所以这里钳在 30 秒以内。
+RENDER_TIMEOUT_CAP_MS = 25_000
+
+# /余额 命令的 RPC 超时（Host 侧 CommandEntry.timeout_ms）。Host 默认 60 秒，而单平台最坏
+# 耗时是 MAX_FETCH_ATTEMPTS × timeout + 退避，再加渲染与发送；timeout 调到 30 秒以上时
+# 默认值就不够，Host 会先判"执行失败"、插件稍后又照常发出结果。按最坏情况显式声明。
+COMMAND_RPC_TIMEOUT_MS = int(
+    (MAX_TIMEOUT * MAX_FETCH_ATTEMPTS + RETRY_BACKOFF_SECONDS * MAX_FETCH_ATTEMPTS) * 1000
+    + RENDER_TIMEOUT_CAP_MS
+    + 30_000  # 发送与调度余量
+)
 
 
 # --- 网络层 ---
@@ -183,7 +203,7 @@ class SettingsSection(PluginConfigBase):
     timeout: int = Field(
         default=DEFAULT_TIMEOUT,
         description="单平台请求超时秒数",
-        ge=1, le=60,
+        ge=1, le=MAX_TIMEOUT,
         json_schema_extra={"label": "请求超时（秒）"},
     )
     admin_only: bool = Field(
@@ -196,6 +216,31 @@ class SettingsSection(PluginConfigBase):
         description="允许使用 /余额 命令的用户 QQ 号列表",
         json_schema_extra={"label": "管理员列表", "hint": "仅 admin_only=true 时生效"},
     )
+
+    @field_validator("admin_user_ids", mode="before")
+    @classmethod
+    def _coerce_admin_user_ids(cls, value: Any) -> Any:
+        """把手写 TOML 里常见的整数 QQ 号（如 [123456]）宽容地转成字符串。
+
+        pydantic 默认对 List[str] 严格拒绝 int；而 Host 以 suppress_errors=False 注入配置，
+        一条校验错误就会让整个插件激活失败，日志只剩一句"配置加载失败"。这里做 before
+        转换，让 [123456] 与 ["123456"] 等价。非列表输入原样返回，交给 pydantic 报错。
+        """
+        if value is None:
+            return []
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return value
+        normalized: List[str] = []
+        for item in value:
+            if isinstance(item, bool):
+                # True/False 不是 QQ 号，保留原值让 pydantic 报出明确错误。
+                return value
+            text = str(item).strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
     output_format: Literal["text", "image", "both"] = Field(
         default=OUTPUT_FORMAT_IMAGE,
         description='输出格式：text 纯文本 / image HTML 卡片 / both 卡片 + 文本',
@@ -307,35 +352,60 @@ class _BalanceProvider:
     def _build_url(self) -> str:
         return self._require_https_base_url() + self.path
 
-    def fetch_sync(self) -> Dict[str, Any]:
-        url = self._build_url()
+    def _request_json(self, url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """发起 GET 请求并解析 JSON，把所有网络层异常归一化为插件自定义异常。
+
+        覆盖两个阶段：
+          - 连接/发送阶段：urllib 抛 URLError（超时时 reason 为 TimeoutError）；
+          - 读取响应体阶段：socket 层直接抛裸 TimeoutError / ConnectionResetError /
+            ssl.SSLError（都是 OSError 子类）或 http.client.IncompleteRead
+            （HTTPException 子类），不会再被包成 URLError。
+        旧实现只捕获 URLError，读取阶段的异常会穿透成"内部错误"且不参与重试。
+        """
         req = urllib.request.Request(url, method="GET")
-        req.add_header("Authorization", f"Bearer {self.api_key}")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
         req.add_header("Accept", "application/json")
         req.add_header("User-Agent", self.user_agent)
 
         try:
             with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
         except urllib.error.URLError as exc:
-            # Python 3.10+ socket.timeout == TimeoutError；urlopen 超时实际抛 URLError(reason=TimeoutError())，
-            # 不会直接进 except TimeoutError——所以从 exc.reason 还原超时语义。
+            # Python 3.10+ socket.timeout == TimeoutError；urlopen 连接阶段超时抛
+            # URLError(reason=TimeoutError())，从 exc.reason 还原超时语义。
             if isinstance(exc.reason, TimeoutError):
                 raise _BalanceRequestError(f"请求超时：{exc.reason}")
             raise _BalanceRequestError(str(exc.reason or exc))
+        except TimeoutError as exc:
+            raise _BalanceRequestError(f"请求超时：{exc or '读取响应超时'}")
+        except (OSError, http.client.HTTPException) as exc:
+            raise _BalanceRequestError(f"{type(exc).__name__}: {exc}")
 
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise _BalanceRequestError(f"响应体超过 {MAX_RESPONSE_BYTES // 1024} KiB 上限，已放弃解析")
+        body = raw.decode("utf-8", errors="replace")
         try:
-            return json.loads(body)
+            payload = json.loads(body)
         except ValueError as exc:
             raise _BalanceRequestError(f"响应不是合法 JSON：{exc}")
+        if not isinstance(payload, dict):
+            raise _BalanceRequestError(f"响应 JSON 顶层不是对象，而是 {type(payload).__name__}")
+        return payload
+
+    def fetch_sync(self) -> Dict[str, Any]:
+        return self._request_json(
+            self._build_url(),
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
 
     @staticmethod
     def _extract_http_error_detail(exc: urllib.error.HTTPError) -> str:
         try:
-            raw = exc.read().decode("utf-8", errors="replace")
-        except OSError:
+            raw = exc.read(MAX_RESPONSE_BYTES).decode("utf-8", errors="replace")
+        except (OSError, http.client.HTTPException):
             return str(exc.reason or "未知错误")[:200]
         if not raw:
             return str(exc.reason or "未知错误")[:200]
@@ -349,9 +419,12 @@ class _BalanceProvider:
                 msg = str(err.get("message") or "")
                 if msg:
                     return msg[:200]
-            msg = str(parsed.get("message") or "")
+            # OpenAI 风格用小写 message；阿里云 OpenAPI 错误体是首字母大写的 Message，
+            # 只查小写会让鉴权错误退化成截断的原始 JSON。
+            msg = str(parsed.get("message") or parsed.get("Message") or "")
             if msg:
-                return msg[:200]
+                code = str(parsed.get("Code") or "").strip()
+                return (f"{code}: {msg}" if code else msg)[:200]
         return raw[:200]
 
     def to_record(self, payload: Dict[str, Any]) -> "_BalanceRecord":
@@ -440,7 +513,7 @@ class _SiliconFlowProvider(_BalanceProvider):
     def fetch_sync(self) -> Dict[str, Any]:
         payload = super().fetch_sync()
         # SiliconFlow 即使 HTTP 200 也可能在 body 里返回业务失败
-        if isinstance(payload, dict) and payload.get("status") is False:
+        if payload.get("status") is False:
             msg = str(payload.get("message") or "硅基流动返回业务失败")
             raise _BalanceBusinessError(msg)
         return payload
@@ -541,42 +614,24 @@ class _AliyunBssOpenApiProvider(_BalanceProvider):
         }
         params["Signature"] = self._sign(params)
         url = f"{base_url}/?{self._canonical_query(params)}"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", self.user_agent)
+        payload = self._request_json(url)
 
-        try:
-            with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            raise _BalanceHTTPError(exc.code, self._extract_http_error_detail(exc))
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, TimeoutError):
-                raise _BalanceRequestError(f"请求超时：{exc.reason}")
-            raise _BalanceRequestError(str(exc.reason or exc))
+        code = str(payload.get("Code") or "").strip()
+        success = payload.get("Success")
+        success_text = str(success).strip().lower()
+        data = payload.get("Data")
 
-        try:
-            payload = json.loads(body)
-        except ValueError as exc:
-            raise _BalanceRequestError(f"响应不是合法 JSON：{exc}")
+        if success is False or success_text == "false":
+            message = str(payload.get("Message") or "阿里云返回业务失败")
+            raise _BalanceBusinessError(f"{code}: {message}" if code else message)
 
-        if isinstance(payload, dict):
-            code = str(payload.get("Code") or "").strip()
-            success = payload.get("Success")
-            success_text = str(success).strip().lower()
-            data = payload.get("Data")
-
-            if success is False or success_text == "false":
-                message = str(payload.get("Message") or "阿里云返回业务失败")
-                raise _BalanceBusinessError(f"{code}: {message}" if code else message)
-
-            # 阿里云成功响应不总是 Code=200；部分接口会返回 Success/OK，或只返回 Data。
-            success_codes = {"", "200", "success", "ok"}
-            has_success_flag = success is True or success_text == "true"
-            has_balance_data = isinstance(data, dict)
-            if code.lower() not in success_codes and not has_success_flag and not has_balance_data:
-                message = str(payload.get("Message") or "阿里云返回业务失败")
-                raise _BalanceBusinessError(f"{code}: {message}" if code else message)
+        # 阿里云成功响应不总是 Code=200；部分接口会返回 Success/OK，或只返回 Data。
+        success_codes = {"", "200", "success", "ok"}
+        has_success_flag = success is True or success_text == "true"
+        has_balance_data = isinstance(data, dict)
+        if code.lower() not in success_codes and not has_success_flag and not has_balance_data:
+            message = str(payload.get("Message") or "阿里云返回业务失败")
+            raise _BalanceBusinessError(f"{code}: {message}" if code else message)
         return payload
 
     def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
@@ -630,12 +685,18 @@ class LLMBalancePlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._admin_set: set[str] = set()
+        # 实例级并发预算：所有 /余额 命令共享，避免多人同时查询时把默认线程池打满。
+        self._fetch_semaphore = asyncio.Semaphore(DEFAULT_PROVIDER_CONCURRENCY)
+        # 正在进行的查询任务。同一时刻只对各平台发一轮请求，后到的命令直接复用结果；
+        # 权限检查仍逐条执行，不因复用而跳过。
+        self._inflight_query: Optional["asyncio.Task[List[Tuple[_BalanceProvider, Any]]]"] = None
 
     async def on_load(self) -> None:
         self._refresh_admin_cache()
         logger.info("LLM 余额查询插件(v%s)初始化完成。", PLUGIN_VERSION)
 
     async def on_unload(self) -> None:
+        self._inflight_query = None
         logger.info("LLM 余额查询插件已卸载。")
 
     async def on_config_update(
@@ -646,6 +707,9 @@ class LLMBalancePlugin(MaiBotPlugin):
     ) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self._refresh_admin_cache()
+            # 配置（凭证/平台开关）变了，进行中的查询结果不再代表新配置：
+            # 不打断已在等待的命令，只让后续命令重新发起。
+            self._inflight_query = None
             self.ctx.logger.info("LLM 余额插件配置已更新: version=%s", version)
         del config_data
 
@@ -721,12 +785,65 @@ class LLMBalancePlugin(MaiBotPlugin):
                 skipped.append("阿里百炼：已启用但 AccessKey ID/Secret 不完整")
         return result, skipped
 
+    async def _query_providers(
+        self, providers: Sequence[_BalanceProvider],
+    ) -> List[Tuple[_BalanceProvider, Any]]:
+        """并行查询所有 Provider，返回 (provider, record 或异常) 列表。
+
+        阻塞式 urllib 放进线程池，并受实例级信号量限制并发。
+        """
+
+        async def _run(provider: _BalanceProvider) -> Tuple[_BalanceProvider, Any]:
+            try:
+                async with self._fetch_semaphore:
+                    payload = await _fetch_with_retry(provider)
+                return provider, payload
+            except Exception as exc:
+                return provider, exc
+
+        results = await asyncio.gather(*[_run(p) for p in providers])
+
+        # 转换为结构化记录（成功项保留 record，失败项保留异常）
+        records: List[Tuple[_BalanceProvider, Any]] = []
+        for provider, payload_or_exc in results:
+            if isinstance(payload_or_exc, Exception):
+                records.append((provider, payload_or_exc))
+                continue
+            try:
+                records.append((provider, provider.to_record(payload_or_exc)))
+            except Exception as exc:
+                records.append((provider, exc))
+        self._log_provider_errors(records)
+        return records
+
+    async def _get_or_start_query(
+        self, providers: Sequence[_BalanceProvider],
+    ) -> Tuple["asyncio.Task[List[Tuple[_BalanceProvider, Any]]]", bool]:
+        """返回可等待的查询任务；已有进行中的查询时直接复用。
+
+        Returns:
+            (task, joined)：joined=True 表示复用了别人发起的查询。
+        """
+        task = self._inflight_query
+        if task is not None and not task.done():
+            return task, True
+        task = asyncio.create_task(self._query_providers(providers))
+        self._inflight_query = task
+
+        def _clear(done: "asyncio.Task[Any]") -> None:
+            if self._inflight_query is done:
+                self._inflight_query = None
+
+        task.add_done_callback(_clear)
+        return task, False
+
     # ===== 命令处理 =====
 
     @Command(
         "llm_balance_query",
         description="查询所有已启用 LLM 平台的账号余额。格式：/余额",
         pattern=r"^\/余额$",
+        timeout_ms=COMMAND_RPC_TIMEOUT_MS,
     )
     async def handle_balance(self, stream_id: str = "", group_id: str = "",
                              user_id: str = "", text: str = "",
@@ -763,37 +880,24 @@ class LLMBalancePlugin(MaiBotPlugin):
             )
             return False, "无可用平台", 1
 
-        await self.ctx.send.text(
-            f"⏳ 正在并行查询 {len(providers)} 个平台...", stream_id,
-        )
+        query_task, joined = await self._get_or_start_query(providers)
+        if joined:
+            await self.ctx.send.text(
+                "⏳ 已有一轮余额查询正在进行，稍后直接复用其结果...", stream_id,
+            )
+        else:
+            await self.ctx.send.text(
+                f"⏳ 正在并行查询 {len(providers)} 个平台...", stream_id,
+            )
 
-        # 并行查询；阻塞式 urllib 放进线程池时限制并发，避免多平台扩展后压垮默认线程池。
-        fetch_semaphore = asyncio.Semaphore(
-            max(1, min(DEFAULT_PROVIDER_CONCURRENCY, len(providers))),
-        )
-
-        async def _run(provider: _BalanceProvider) -> Tuple[_BalanceProvider, Any]:
-            try:
-                async with fetch_semaphore:
-                    payload = await _fetch_with_retry(provider)
-                return provider, payload
-            except Exception as exc:
-                return provider, exc
-
-        results = await asyncio.gather(*[_run(p) for p in providers])
-
-        # 转换为结构化记录（成功项保留 record，失败项保留异常）
-        records: List[Tuple[_BalanceProvider, Any]] = []
-        for provider, payload_or_exc in results:
-            if isinstance(payload_or_exc, Exception):
-                records.append((provider, payload_or_exc))
-                continue
-            try:
-                records.append((provider, provider.to_record(payload_or_exc)))
-            except Exception as exc:
-                records.append((provider, exc))
-
-        self._log_provider_errors(records)
+        try:
+            records = await query_task
+        except Exception as exc:
+            # _query_providers 内部已把单平台异常收进 records，走到这里是调度层面的意外
+            # （例如任务被取消）。给用户一句话，细节进日志。
+            logger.error("余额查询任务异常终止: %s", exc, exc_info=True)
+            await self.ctx.send.text("❌ 余额查询意外中断，请稍后重试（详见日志）", stream_id)
+            return False, "查询任务异常：%s" % exc, 1
 
         # 按 output_format 输出
         fmt = (self.config.settings.output_format or OUTPUT_FORMAT_TEXT).lower()
@@ -820,7 +924,10 @@ class LLMBalancePlugin(MaiBotPlugin):
                         viewport={"width": 720, "height": self._estimate_card_viewport_height(records)},
                         device_scale_factor=2.0,
                         full_page=True,
-                        render_timeout_ms=max(1, self.config.settings.timeout) * 1000,
+                        # 钳在 cap.call 的 30 秒 RPC 默认超时以内，否则 RPC 先超时、渲染必败。
+                        render_timeout_ms=min(
+                            max(1, self.config.settings.timeout) * 1000, RENDER_TIMEOUT_CAP_MS,
+                        ),
                     )
                 except Exception as exc:
                     failure_stage = "html2png"
@@ -1053,11 +1160,21 @@ body {{
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
-  padding: 8px 0 0 0;
-  border-top: 1px dashed #e5e7eb;
-  margin-top: 8px;
 }}
-.entry:first-of-type {{ border-top: 0; margin-top: 0; padding-top: 0; }}
+.entry-currency {{
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+}}
+/* 第二组及之后的币种块与上一组之间用虚线分隔。
+   旧写法在 .entry 上用 first-of-type 伪类去掉首组边框永远命中不了——该伪类按标签
+   类型算，.provider 里第一个 div 是 .provider-head，导致每一组头上都多一条线。 */
+.entry + .entry-currency {{
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed #e5e7eb;
+}}
 .entry-cell .label {{
   font-size: 11px;
   color: #6b7280;
@@ -1070,12 +1187,6 @@ body {{
   font-variant-numeric: tabular-nums;
 }}
 .entry-cell .value.total {{ color: #2563eb; }}
-.entry-currency {{
-  font-size: 11px;
-  color: #6b7280;
-  margin-bottom: 6px;
-  letter-spacing: 0.5px;
-}}
 .error-text {{
   color: #991b1b;
   font-size: 13px;
