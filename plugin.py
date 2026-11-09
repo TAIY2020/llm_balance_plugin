@@ -13,38 +13,52 @@ import html
 import http.client
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import (
+    CONFIG_RELOAD_SCOPE_SELF,
+    ON_BOT_CONFIG_RELOAD,
+    Command,
+    ConfigWidget,
+    ConfigWidgetState,
+    Field,
+    MaiBotPlugin,
+    PluginConfigBase,
+)
 from pydantic import field_validator
 
 logger = logging.getLogger(__name__)
 
 # --- 常量 ---
 
-def _load_manifest_version() -> str:
-    """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
+def _load_manifest_field(key: str, fallback: str) -> str:
+    """从 _manifest.json 读取字符串字段，保持插件元数据单一来源。"""
     try:
         manifest_path = Path(__file__).parent / "_manifest.json"
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        version = data.get("version")
-        if isinstance(version, str) and version.strip():
-            return version.strip()
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
         logger.warning(
-            "_manifest.json 中 version 字段缺失或非法 (%r)，回落到 0.0.0", version,
+            "_manifest.json 中 %s 字段缺失或非法 (%r)，回落到 %s", key, value, fallback,
         )
     except Exception:
-        logger.warning("读取 _manifest.json 失败，回落到 0.0.0", exc_info=True)
-    return "0.0.0"
+        logger.warning("读取 _manifest.json 失败，%s 回落到 %s", key, fallback, exc_info=True)
+    return fallback
 
 
-PLUGIN_VERSION = _load_manifest_version()
+PLUGIN_VERSION = _load_manifest_field("version", "0.0.0")
+PLUGIN_ID = _load_manifest_field("id", "TAIY2020.llm-balance-plugin")
+COMMAND_NAME = "llm_balance_query"
+# Host 命令管理里的命令 ID，额外授权（command_permissions）按它索引。
+COMMAND_ID = f"{PLUGIN_ID}.{COMMAND_NAME}"
 CONFIG_SCHEMA_VERSION = "1.5.0"
 DEFAULT_TIMEOUT = 10  # 秒
 MAX_TIMEOUT = 60  # 秒，settings.timeout 的上限，须与 SettingsSection.timeout 的 le 保持一致
@@ -106,6 +120,25 @@ COMMAND_RPC_TIMEOUT_MS = int(
     + RENDER_TIMEOUT_CAP_MS
     + 30_000  # 发送与调度余量
 )
+
+# 配置节名 → 展示名，顺序即查询与展示顺序。
+PROVIDER_SECTIONS = (
+    ("deepseek", "DeepSeek"),
+    ("siliconflow", "硅基流动"),
+    ("aliyun", "阿里百炼"),
+)
+
+# 配置页运行时控件。Host 对单次状态读取/按钮操作限时 8 秒，而一轮查询最坏要一两分钟，
+# 所以按钮只负责拉起后台查询，结果写进内存，由页面约 2 秒一次的轮询展示。
+WIDGET_QUERY = "query"
+WIDGET_QUERY_STATUS = "query_status"
+WIDGET_PERMISSION = "permission"
+WIDGET_BALANCE_PREFIX = "balance."
+# 读取 Host 权限配置的期限（毫秒）：既在 on_load 里等，也在 8 秒限时的按钮操作里等。
+HOST_POLICY_FETCH_TIMEOUT_MS = 3000
+# 旧 admin_user_ids 里是裸 QQ 号，迁移到 Host 权限时补上的平台前缀。
+LEGACY_ADMIN_PLATFORM = "qq"
+STATUS_LEVEL_WIDGET_TONES = {"ok": "success", "warn": "warning", "info": "neutral"}
 
 
 # --- 网络层 ---
@@ -182,6 +215,21 @@ async def _fetch_with_retry(provider: "_BalanceProvider") -> Dict[str, Any]:
     raise last_exc
 
 
+def _normalize_scoped_users(values: Any) -> set[str]:
+    """规范化 ``平台:用户 ID`` 列表，口径同 Host ``normalize_operator_permissions``
+    （仅平台转小写，用户 ID 大小写敏感）。"""
+    if not isinstance(values, (list, tuple)):
+        return set()
+    normalized: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        platform, _, user_id = text.partition(":")
+        normalized.add(f"{platform.strip().lower()}:{user_id.strip()}")
+    return normalized
+
+
 # --- 配置模型 ---
 
 class PluginSection(PluginConfigBase):
@@ -206,15 +254,21 @@ class SettingsSection(PluginConfigBase):
         ge=1, le=MAX_TIMEOUT,
         json_schema_extra={"label": "请求超时（秒）"},
     )
+    # admin_only / admin_user_ids 自 1.7.0 起弃用：/余额 改为 Host 受保护命令（permission="operator"），
+    # 由主程序「命令管理」统一鉴权。字段暂留只为读出旧值、在日志和配置页提示迁移；
+    # 以后真正删除时须同时升 CONFIG_SCHEMA_VERSION，否则旧键会一直残留在 config.toml 里。
     admin_only: bool = Field(
         default=True,
-        description="是否仅允许管理员使用 /余额 命令",
-        json_schema_extra={"label": "仅管理员可用"},
+        description="已弃用：/余额 固定只允许主程序管理员及命令管理中额外授权的用户/聊天使用",
+        json_schema_extra={"label": "仅管理员可用（已弃用）", "disabled": True},
     )
     admin_user_ids: List[str] = Field(
         default_factory=list,
-        description="允许使用 /余额 命令的用户 QQ 号列表",
-        json_schema_extra={"label": "管理员列表", "hint": "仅 admin_only=true 时生效"},
+        description="已弃用：请把这些 QQ 号以 qq:号码 的格式加入主程序「命令管理」的管理员或本命令的额外授权",
+        json_schema_extra={
+            "label": "管理员列表（已弃用）",
+            "hint": "仅用于迁移提示，不再参与鉴权。请到主程序「命令管理」配置",
+        },
     )
 
     @field_validator("admin_user_ids", mode="before")
@@ -318,6 +372,7 @@ class _BalanceProvider:
     """
 
     display_name: str = ""
+    config_key: str = ""  # 对应的配置节名，配置页按它把结果归到各平台的状态行
     path: str = ""
     user_agent: str = f"MaiBot-LLMBalance/{PLUGIN_VERSION}"
 
@@ -470,6 +525,7 @@ class _BalanceRecord:
 
 class _DeepSeekProvider(_BalanceProvider):
     display_name = "DeepSeek"
+    config_key = "deepseek"
     path = DEEPSEEK_BALANCE_PATH
 
     @property
@@ -504,6 +560,7 @@ class _DeepSeekProvider(_BalanceProvider):
 
 class _SiliconFlowProvider(_BalanceProvider):
     display_name = "硅基流动"
+    config_key = "siliconflow"
     path = SILICONFLOW_USER_INFO_PATH
 
     @property
@@ -590,6 +647,7 @@ class _AliyunBssOpenApiProvider(_BalanceProvider):
     """
 
     display_name = "阿里百炼"
+    config_key = "aliyun"
 
     def __init__(self, access_key_id: str, access_key_secret: str,
                  endpoint: str, timeout: int) -> None:
@@ -681,22 +739,46 @@ class LLMBalancePlugin(MaiBotPlugin):
     """LLM 平台余额查询插件。"""
 
     config_model = LLMBalanceConfig
+    # 订阅主程序全局配置广播，只用于刷新配置页里的「使用权限」摘要。
+    config_reload_subscriptions = (ON_BOT_CONFIG_RELOAD,)
+    config_widgets = [
+        ConfigWidget(id=WIDGET_QUERY, kind="action", label="立即查询余额"),
+        ConfigWidget(id=WIDGET_QUERY_STATUS, kind="status", label="查询状态"),
+        *(
+            ConfigWidget(id=f"{WIDGET_BALANCE_PREFIX}{key}", kind="status", label=name)
+            for key, name in PROVIDER_SECTIONS
+        ),
+        ConfigWidget(id=WIDGET_PERMISSION, kind="status", label="/余额 使用权限"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
-        self._admin_set: set[str] = set()
         # 实例级并发预算：所有 /余额 命令共享，避免多人同时查询时把默认线程池打满。
         self._fetch_semaphore = asyncio.Semaphore(DEFAULT_PROVIDER_CONCURRENCY)
         # 正在进行的查询任务。同一时刻只对各平台发一轮请求，后到的命令直接复用结果；
-        # 权限检查仍逐条执行，不因复用而跳过。
+        # 权限由 Host 在调用命令前逐条检查，不因复用而跳过。
         self._inflight_query: Optional["asyncio.Task[List[Tuple[_BalanceProvider, Any]]]"] = None
+        # 配置页查询的状态（只在内存里）。配置每更新一次 generation 加一，旧配置下发起的
+        # 查询完成后不再写回结果，避免新配置的页面显示旧凭证的余额。
+        self._panel_generation = 0
+        self._panel_task: Optional["asyncio.Task[None]"] = None
+        self._panel_results: Dict[str, Any] = {}
+        self._panel_finished_at: Optional[float] = None
+        self._panel_notice: Optional[str] = None
+        # Host 全局配置的 plugin 节（命令权限相关）；None 表示还没读到。
+        self._host_plugin_section: Optional[Mapping[str, Any]] = None
+        self._host_policy_error: Optional[str] = None
 
     async def on_load(self) -> None:
-        self._refresh_admin_cache()
+        self._log_legacy_admin_settings()
+        await self._refresh_host_policy()
         logger.info("LLM 余额查询插件(v%s)初始化完成。", PLUGIN_VERSION)
 
     async def on_unload(self) -> None:
         self._inflight_query = None
+        task, self._panel_task = self._panel_task, None
+        if task is not None and not task.done():
+            task.cancel()
         logger.info("LLM 余额查询插件已卸载。")
 
     async def on_config_update(
@@ -706,20 +788,65 @@ class LLMBalancePlugin(MaiBotPlugin):
         version: str,
     ) -> None:
         if scope == CONFIG_RELOAD_SCOPE_SELF:
-            self._refresh_admin_cache()
             # 配置（凭证/平台开关）变了，进行中的查询结果不再代表新配置：
             # 不打断已在等待的命令，只让后续命令重新发起。
             self._inflight_query = None
+            self._panel_generation += 1
+            if self._panel_results or self._panel_task is not None:
+                self._panel_notice = "插件配置已更新，旧的查询结果已清除，请重新查询"
+            self._panel_results = {}
+            self._panel_finished_at = None
+            self._panel_task = None
+            self._log_legacy_admin_settings()
             self.ctx.logger.info("LLM 余额插件配置已更新: version=%s", version)
-        del config_data
+        elif scope == ON_BOT_CONFIG_RELOAD:
+            section = config_data.get("plugin")
+            if isinstance(section, Mapping):
+                self._host_plugin_section = section
+                self._host_policy_error = None
 
     # ===== 辅助 =====
 
-    def _refresh_admin_cache(self) -> None:
-        self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
+    def _log_legacy_admin_settings(self) -> None:
+        """旧的插件内鉴权配置已弃用，仍有值时提示迁移到 Host 命令权限。"""
+        settings = self.config.settings
+        if settings.admin_user_ids:
+            logger.warning(
+                "[settings].admin_user_ids 已弃用且不再生效，/余额 改由主程序「命令管理」鉴权。"
+                "请把以下用户加入主程序管理员或本命令（%s）的额外授权：%s",
+                COMMAND_ID,
+                ", ".join(f"{LEGACY_ADMIN_PLATFORM}:{uid}" for uid in settings.admin_user_ids),
+            )
+        if not settings.admin_only:
+            logger.warning(
+                "[settings].admin_only=false 已不再生效：/余额 固定为受保护命令。"
+                "如需放开给某个群，请在主程序「命令管理」中为 %s 额外授权该聊天",
+                COMMAND_ID,
+            )
 
-    def _check_admin(self, user_id: str) -> bool:
-        return str(user_id) in self._admin_set
+    async def _refresh_host_policy(self) -> None:
+        """读取 Host 全局配置的 plugin 节，供配置页展示 /余额 的使用权限。"""
+        try:
+            section = await asyncio.wait_for(
+                self.ctx.call_capability(
+                    "config.get", key="plugin", default=None, timeout_ms=HOST_POLICY_FETCH_TIMEOUT_MS,
+                ),
+                timeout=HOST_POLICY_FETCH_TIMEOUT_MS / 1000,
+            )
+        except asyncio.TimeoutError:
+            self._host_policy_error = "读取主程序权限配置超时"
+            logger.warning("%s", self._host_policy_error)
+            return
+        except Exception as exc:
+            self._host_policy_error = f"读取主程序权限配置失败：{exc}"
+            logger.warning("%s", self._host_policy_error)
+            return
+        if not isinstance(section, Mapping) or not isinstance(section.get("permission"), (list, tuple)):
+            self._host_policy_error = "主程序返回的 plugin 配置结构异常，无法确认命令权限"
+            logger.warning("%s", self._host_policy_error)
+            return
+        self._host_plugin_section = section
+        self._host_policy_error = None
 
     @staticmethod
     def _capability_error_message(result: Any) -> Optional[str]:
@@ -736,6 +863,46 @@ class LLMBalancePlugin(MaiBotPlugin):
             return str(error or "能力调用返回 success=false")
         return None
 
+    def _build_provider(self, key: str) -> Tuple[Optional[_BalanceProvider], Optional[str]]:
+        """按配置节构造单个 Provider。
+
+        Returns:
+            (provider, None)：可查询；(None, note)：已启用但凭证不完整；
+            (None, None)：未启用。
+        """
+        timeout = self.config.settings.timeout
+        if key == "deepseek":
+            section = self.config.deepseek
+            if not section.enabled:
+                return None, None
+            api_key = section.api_key.strip()
+            if not api_key:
+                return None, "DeepSeek：已启用但未配置 API Key"
+            return _DeepSeekProvider(api_key=api_key, base_url=section.base_url.strip(), timeout=timeout), None
+        if key == "siliconflow":
+            section = self.config.siliconflow
+            if not section.enabled:
+                return None, None
+            api_key = section.api_key.strip()
+            if not api_key:
+                return None, "硅基流动：已启用但未配置 API Key"
+            return _SiliconFlowProvider(api_key=api_key, base_url=section.base_url.strip(), timeout=timeout), None
+        if key == "aliyun":
+            section = self.config.aliyun
+            if not section.enabled:
+                return None, None
+            access_key_id = section.access_key_id.strip()
+            access_key_secret = section.access_key_secret.strip()
+            if not (access_key_id and access_key_secret):
+                return None, "阿里百炼：已启用但 AccessKey ID/Secret 不完整"
+            return _AliyunBssOpenApiProvider(
+                access_key_id=access_key_id,
+                access_key_secret=access_key_secret,
+                endpoint=section.endpoint.strip(),
+                timeout=timeout,
+            ), None
+        raise ValueError(f"未知的平台配置节: {key}")
+
     def _collect_providers(self) -> Tuple[List[_BalanceProvider], List[str]]:
         """根据当前配置构造所有 enabled 平台的 Provider 实例。
 
@@ -744,45 +911,15 @@ class LLMBalancePlugin(MaiBotPlugin):
             skipped_notes 为"已启用但凭证不完整、已跳过"的平台提示，用于在结果里
             明确告知用户，而不是只写进日志后静默消失。
         """
-        settings = self.config.settings
         result: List[_BalanceProvider] = []
         skipped: List[str] = []
-
-        if self.config.deepseek.enabled:
-            api_key = self.config.deepseek.api_key.strip()
-            if api_key:
-                result.append(_DeepSeekProvider(
-                    api_key=api_key,
-                    base_url=self.config.deepseek.base_url.strip(),
-                    timeout=settings.timeout,
-                ))
-            else:
-                logger.warning("DeepSeek 已启用 (enabled=true) 但 api_key 为空，已跳过查询")
-                skipped.append("DeepSeek：已启用但未配置 API Key")
-        if self.config.siliconflow.enabled:
-            api_key = self.config.siliconflow.api_key.strip()
-            if api_key:
-                result.append(_SiliconFlowProvider(
-                    api_key=api_key,
-                    base_url=self.config.siliconflow.base_url.strip(),
-                    timeout=settings.timeout,
-                ))
-            else:
-                logger.warning("硅基流动已启用 (enabled=true) 但 api_key 为空，已跳过查询")
-                skipped.append("硅基流动：已启用但未配置 API Key")
-        if self.config.aliyun.enabled:
-            access_key_id = self.config.aliyun.access_key_id.strip()
-            access_key_secret = self.config.aliyun.access_key_secret.strip()
-            if access_key_id and access_key_secret:
-                result.append(_AliyunBssOpenApiProvider(
-                    access_key_id=access_key_id,
-                    access_key_secret=access_key_secret,
-                    endpoint=self.config.aliyun.endpoint.strip(),
-                    timeout=settings.timeout,
-                ))
-            else:
-                logger.warning("阿里云已启用 (enabled=true) 但 AccessKey 配置不完整，已跳过查询")
-                skipped.append("阿里百炼：已启用但 AccessKey ID/Secret 不完整")
+        for key, _name in PROVIDER_SECTIONS:
+            provider, skipped_note = self._build_provider(key)
+            if provider is not None:
+                result.append(provider)
+            elif skipped_note is not None:
+                logger.warning("%s，已跳过查询", skipped_note)
+                skipped.append(skipped_note)
         return result, skipped
 
     async def _query_providers(
@@ -837,31 +974,171 @@ class LLMBalancePlugin(MaiBotPlugin):
         task.add_done_callback(_clear)
         return task, False
 
+    # ===== 配置页运行时控件 =====
+
+    async def get_config_widget_state(self) -> Dict[str, ConfigWidgetState]:
+        """页面约 2 秒读一次，只拼内存快照，不发网络请求。"""
+        running = self._panel_task is not None and not self._panel_task.done()
+        states: Dict[str, ConfigWidgetState] = {
+            WIDGET_QUERY: ConfigWidgetState(disabled=running),
+            WIDGET_QUERY_STATUS: self._panel_query_status_state(running),
+            WIDGET_PERMISSION: self._panel_permission_state(),
+        }
+        for key, _name in PROVIDER_SECTIONS:
+            states[f"{WIDGET_BALANCE_PREFIX}{key}"] = self._panel_balance_state(key, running)
+        return states
+
+    async def on_config_widget_action(self, action_id: str) -> None:
+        if action_id != WIDGET_QUERY:
+            raise ValueError(f"未知操作: {action_id}")
+        if self._panel_task is not None and not self._panel_task.done():
+            return
+        providers, _skipped = self._collect_providers()
+        self._panel_results = {}
+        self._panel_finished_at = None
+        if not providers:
+            self._panel_notice = "没有可查询的平台：请先启用平台、填好凭证并保存配置"
+            return
+        self._panel_notice = None
+        self._panel_task = asyncio.create_task(self._run_panel_query(providers, self._panel_generation))
+        # 顺带刷新权限摘要；读取有期限，不会拖过 Host 对单次操作的 8 秒限时。
+        await self._refresh_host_policy()
+
+    async def _run_panel_query(self, providers: Sequence[_BalanceProvider], generation: int) -> None:
+        """配置页的后台查询；与 /余额 命令共用同一轮请求。"""
+        try:
+            task, _joined = await self._get_or_start_query(providers)
+            # shield：卸载时取消本任务，不能连带取消可能正被 /余额 命令等待的共享查询。
+            records = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("配置页余额查询异常终止: %s", exc, exc_info=True)
+            if generation == self._panel_generation:
+                self._panel_notice = "查询意外中断，请稍后重试（详见日志）"
+            return
+        if generation != self._panel_generation:
+            return
+        self._panel_results = {provider.config_key: item for provider, item in records}
+        self._panel_finished_at = time.time()
+
+    def _panel_query_status_state(self, running: bool) -> ConfigWidgetState:
+        if running:
+            return ConfigWidgetState(text="正在查询已保存配置中启用的平台…")
+        if self._panel_notice:
+            return ConfigWidgetState(text=self._panel_notice, tone="warning")
+        if self._panel_finished_at is None:
+            return ConfigWidgetState(
+                text="尚未查询。点击「立即查询余额」按已保存的配置查询，未保存的修改不会生效",
+            )
+        when = time.strftime("%m-%d %H:%M:%S", time.localtime(self._panel_finished_at))
+        total = len(self._panel_results)
+        failed = sum(1 for item in self._panel_results.values() if isinstance(item, Exception))
+        if failed:
+            return ConfigWidgetState(
+                text=f"{when} 查询完成：{total - failed} 个成功，{failed} 个失败", tone="warning",
+            )
+        return ConfigWidgetState(text=f"{when} 查询完成：{total} 个平台均成功", tone="success")
+
+    def _panel_balance_state(self, key: str, running: bool) -> ConfigWidgetState:
+        provider, skipped_note = self._build_provider(key)
+        if skipped_note is not None:
+            return ConfigWidgetState(text=skipped_note.split("：", 1)[-1], tone="warning")
+        if provider is None:
+            return ConfigWidgetState(text="未启用", visible=False)
+        if key in self._panel_results:
+            return self._widget_state_for_item(provider, self._panel_results[key])
+        return ConfigWidgetState(text="查询中…" if running else "尚未查询")
+
+    @classmethod
+    def _widget_state_for_item(cls, provider: _BalanceProvider, item: Any) -> ConfigWidgetState:
+        error_line = cls._format_error_line(provider, item)
+        if error_line is not None:
+            return ConfigWidgetState(text=error_line.removeprefix("❌ "), tone="error")
+        assert isinstance(item, _BalanceRecord)
+        parts: List[str] = []
+        if item.status:
+            parts.append(item.status)
+        parts.extend(cls._format_entry_summary(entry) for entry in item.entries)
+        if item.note:
+            parts.append(item.note)
+        return ConfigWidgetState(
+            text=(" · ".join(parts) or "无可展示的余额条目")[:2000],
+            tone=STATUS_LEVEL_WIDGET_TONES.get(item.status_level, "warning"),
+        )
+
+    @staticmethod
+    def _format_entry_summary(entry: Dict[str, Any]) -> str:
+        currency = entry.get("currency") or "?"
+        symbol = CURRENCY_SYMBOLS.get(currency, "")
+        labels = entry.get("labels") or {}
+        amounts = [
+            f"{labels.get(key) or default_label} {symbol}{entry[key]}"
+            for key, default_label in (("total", "总余额"), ("granted", "赠金余额"), ("topped", "充值余额"))
+            if entry.get(key) is not None
+        ]
+        return f"[{currency}] " + ("，".join(amounts) or "无金额")
+
+    def _panel_permission_state(self) -> ConfigWidgetState:
+        """按 Host 命令链（bot.py::_process_commands）的口径汇总 /余额 当前谁能用。"""
+        section = self._host_plugin_section
+        if section is None:
+            return ConfigWidgetState(
+                text=self._host_policy_error or "尚未读取主程序权限配置", tone="warning",
+            )
+        operators = _normalize_scoped_users(section.get("permission"))
+        command_rules = section.get("command_permissions")
+        rule = command_rules.get(COMMAND_ID) if isinstance(command_rules, Mapping) else None
+        allow_users = _normalize_scoped_users(rule.get("allow_users")) if isinstance(rule, Mapping) else set()
+        raw_chats = rule.get("allow_chats") if isinstance(rule, Mapping) else None
+        allow_chats = {str(c).strip() for c in raw_chats if str(c).strip()} if isinstance(raw_chats, list) else set()
+        disabled_commands = section.get("disabled_commands")
+        disabled = isinstance(disabled_commands, list) and COMMAND_ID in disabled_commands
+        usage_rules = section.get("usage_permissions")
+        usage_rule = usage_rules.get(PLUGIN_ID) if isinstance(usage_rules, Mapping) else None
+        usage_limited = isinstance(usage_rule, Mapping) and usage_rule.get("enabled") is True
+
+        nobody = not (operators or allow_users or allow_chats)
+        legacy = [
+            scoped for scoped in (
+                f"{LEGACY_ADMIN_PLATFORM}:{uid.strip()}" for uid in self.config.settings.admin_user_ids
+            )
+            if scoped not in operators and scoped not in allow_users
+        ]
+        parts: List[str] = []
+        if disabled:
+            parts.append("/余额 已在「命令管理」中停用，会按普通消息处理")
+        if nobody:
+            parts.append("除 WebUI 本地控制台外无人能用，请在主程序「命令管理」配置管理员或为本命令额外授权")
+        parts.append(f"主程序管理员 {len(operators)} 人")
+        parts.append(f"本命令额外授权 {len(allow_users)} 个用户、{len(allow_chats)} 个聊天")
+        if usage_limited:
+            parts.append("已开启插件使用范围限制，管理员也须在放行范围内")
+        if legacy:
+            parts.append("旧管理员列表尚未迁移：" + "、".join(legacy))
+        if nobody:
+            tone = "error"
+        elif disabled or legacy:
+            tone = "warning"
+        else:
+            tone = "success"
+        return ConfigWidgetState(text=" · ".join(parts)[:2000], tone=tone)
+
     # ===== 命令处理 =====
 
+    # permission="operator"：Host 在调用前按「命令管理」鉴权（全局管理员 + 本命令额外授权的
+    # 用户/聊天；其他插件代发的消息一律无权），无权限时由 Host 统一回执，插件不再自行判断。
     @Command(
-        "llm_balance_query",
+        COMMAND_NAME,
         description="查询所有已启用 LLM 平台的账号余额。格式：/余额",
         pattern=r"^\/余额$",
         timeout_ms=COMMAND_RPC_TIMEOUT_MS,
+        permission="operator",
     )
     async def handle_balance(self, stream_id: str = "", group_id: str = "",
                              user_id: str = "", text: str = "",
                              plugin_config: Optional[dict] = None, **kwargs):
         """查询余额：/余额"""
-        if self.config.settings.admin_only and not self._check_admin(user_id):
-            if not self._admin_set:
-                # admin_only=true 但没人配进白名单 → 所有人(含部署者自己)都被拒。
-                # 这种"全员拒绝"最容易让人摸不着头脑，给出针对性引导而非笼统提示。
-                deny_msg = (
-                    "❌ 『仅管理员可用』已开启，但管理员列表为空，当前没有人能查询。\n"
-                    "请在配置 [settings].admin_user_ids 中加入你的 QQ 号，或把 admin_only 关掉。"
-                )
-            else:
-                deny_msg = "❌ 你没有权限查询 LLM 平台余额"
-            await self.ctx.send.text(deny_msg, stream_id)
-            return False, "用户 %s 无权限" % user_id, 1
-
         providers, skipped_notes = self._collect_providers()
         if not providers:
             if skipped_notes:
