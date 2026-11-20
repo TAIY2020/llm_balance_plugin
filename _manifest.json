@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.7.0",
+  "version": "1.8.0",
   "name": "LLM 平台余额查询插件 | LLM Balance Plugin",
-  "description": "通过聊天命令 /余额 并行查询 DeepSeek、SiliconFlow 和阿里云账号余额，支持 HTML 卡片可视化输出和配置页一键查询，仅依赖 Python 标准库。",
+  "description": "通过聊天命令 /余额 并行查询 DeepSeek、SiliconFlow、阿里云和最多 3 个自定义源（New API / One API、DeepSeek 风格、JSON 字段映射）余额，支持 HTML 卡片可视化输出和配置页一键查询，仅依赖 Python 标准库。",
   "author": {
     "name": "TaiYang",
     "url": "https://github.com/TAIY2020"
