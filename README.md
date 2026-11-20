@@ -1,6 +1,6 @@
 # LLM 平台余额查询插件 (LLM Balance Plugin)
 
-💰 **一个让麦麦通过 `/余额` 一条命令查看你 DeepSeek、硅基流动和阿里云（百炼扣费账户）余额的小工具。**
+💰 **一个让麦麦通过 `/余额` 一条命令查看你 DeepSeek、硅基流动、阿里云（百炼扣费账户）以及自定义源（New API / One API、DeepSeek 风格、JSON 映射）余额的小工具。**
 
 > 本版本基于 **MaiBot SDK v2** 开发，使用 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。**推荐通过 Web UI 修改配置**。
 
@@ -11,6 +11,7 @@
 
 - **一条命令查所有平台**: `/余额` 同时去问已启用的平台，结果汇总成一条消息发出来。
 - **支持多个余额来源**: **DeepSeek** 和 **阿里云账号余额** 开箱即用，填好凭证就能用。**SiliconFlow（硅基流动）** 见下方说明——该平台已停止通过 API 提供余额数据。
+- **自定义源**: 提供 3 个独立槽位，协议可选 **New API / One API**、**DeepSeek `/user/balance` 风格**，或 **通用 JSON 字段映射**（点分路径，如 `data.quota`）。
 - **支持百炼扣费账户余额**: 通过阿里云费用中心 `QueryAccountBalance` 查询账号级可用额度，可用于判断百炼后付费扣费账户是否还有余额。
 - **图片卡片输出**: 默认把结果渲染成一张漂亮的卡片图片，带状态徽标、币种分组，比纯文本好看得多。
 - **配置页一键查询**: 在 Web UI 插件配置页点「立即查询余额」，各平台余额与错误直接显示在页面上，填完凭证就能当场验证，不用再去聊天里发命令。
@@ -96,10 +97,69 @@
 
 阿里云调用权限：用于查询的 RAM 用户需要允许调用 `QueryAccountBalance`。推荐使用下面的最小权限策略，而不是直接绑定 `AliyunBSSReadOnlyAccess`。
 
+#### 平台配置（自定义源 1 / 2 / 3）
+
+Web UI 无法展开「列表套对象」的嵌套配置，因此自定义源做成 3 个顶层槽位：`[custom_1]`、`[custom_2]`、`[custom_3]`，字段相同。未启用的槽位在配置页余额状态里会隐藏。
+
+| 配置项（Web UI / TOML） | 默认值 | 说明 |
+| ------ | ------ | ---- |
+| 启用此自定义源（`enabled`） | `false` | 是否启用该槽位 |
+| 显示名称（`name`） | `""` | 卡片和 `/余额` 文本里显示的名字；留空则为「自定义源 N」 |
+| 协议（`protocol`） | `"newapi"` | `newapi`（New API / One API）、`deepseek`（`/user/balance` 风格）、`json`（自定路径 + JSON 字段） |
+| API Key / 访问令牌（`api_key`） | `""` | **New API 请填系统访问令牌**，不是模型调用用的 `sk-` Key |
+| API 基地址（`base_url`） | `""` | 必须是 HTTPS。New API 可填站点根或 `.../v1`（去掉末尾 `/v1`、`/api`）；deepseek 会去掉末尾 `/v1` |
+| 查询路径（`path`） | `""` | 留空用协议默认：newapi=`/api/user/self`，deepseek=`/user/balance`；json **必须填写** |
+| New-Api-User（`new_api_user`） | `""` | 部分 New API 站点要求把用户 ID 放进请求头；填写后会同时发送 `New-Api-User` 和 `New-API-User` |
+| 额度换算除数（`quota_divisor`） | `0` | `0`=按协议默认。newapi 默认 `500000`（50 万额度 = 1 美元）；deepseek / json 默认不换算。填 `1` 表示不换算 |
+| 展示币种（`currency`） | `""` | 留空则 newapi=`USD`，deepseek=接口返回，json=`CNY` |
+| JSON 路径（主金额）（`json_total`） | `""` | 点分路径，如 `data.quota`。newapi 默认 `data.quota`；json 至少填一个金额路径。**deepseek 协议忽略 JSON 路径**，固定解析 `balance_infos` |
+| JSON 路径（第二金额）（`json_granted`） | `""` | newapi 默认 `data.used_quota`（已用额度） |
+| JSON 路径（第三金额）（`json_topped`） | `""` | 可选附加金额 |
+| JSON 路径（成功标志）（`json_success`） | `""` | 如 `success`。值为 false/0 时按业务失败处理；留空时 newapi / json 仍检查根级 `success` |
+
+协议对照：
+
+- **newapi**：`GET {站点根}/api/user/self`，Bearer 鉴权。读 `data.quota` / `data.used_quota`，再除以换算除数。`oneapi` / `one-api` 会当成 `newapi`。
+- **deepseek**：`GET {base_url}/user/balance`，按官方 DeepSeek 的 `is_available` + `balance_infos`（多币种）解析。基地址末尾的 `/v1` 会去掉。给兼容该接口的网关用；官方 DeepSeek 请继续用上面的「DeepSeek」节。
+- **json**：同样 GET + Bearer，按你填的路径取值。可用来对接字段名不同、但仍然是「一个 HTTPS JSON 对象」的余额口。
+
+> **常见填错**：New API 控制台里「API 密钥」（`sk-...`）只能调模型，查余额要到「个人设置 → 安全设置 → 系统访问令牌」。若接口返回 401/403，插件会提示这一点。站点如果要求用户 ID，到个人中心复制后填进 `New-Api-User`。
+
+TOML 示例（New API 中转）：
+
+```toml
+[custom_1]
+enabled = true
+name = "我的中转"
+protocol = "newapi"
+api_key = "你的系统访问令牌"
+base_url = "https://your-newapi.example.com"
+new_api_user = "1"
+quota_divisor = 500000
+```
+
+JSON 映射示例（字段不在默认位置时）：
+
+```toml
+[custom_2]
+enabled = true
+name = "其他网关"
+protocol = "json"
+api_key = "sk-..."
+base_url = "https://gateway.example.com"
+path = "/api/balance"
+json_total = "data.balance"
+json_granted = "data.used"
+json_success = "success"
+quota_divisor = 1
+currency = "CNY"
+```
+
 ### API Key / AccessKey 在哪里拿？
 
 - **DeepSeek**: 登录 [DeepSeek 控制台](https://platform.deepseek.com/api_keys) → 「API Keys」→ 「创建 API Key」
 - **SiliconFlow（硅基流动）**: 登录 [硅基流动控制台](https://cloud.siliconflow.cn/account/ak) → 「API 密钥」→ 「新建 API 密钥」
+- **New API / One API（自定义源）**: 登录站点 → 「个人设置 → 安全设置 → 系统访问令牌」。不要用「API 密钥」页的 `sk-` Key。用户 ID 在个人中心，填到 `New-Api-User`。
 
 #### 阿里云 `access_key_id` / `access_key_secret` 获取方式
 
@@ -141,7 +201,7 @@
 
 ## 🔒 安全说明
 
-- DeepSeek / SiliconFlow / 阿里云访问的都是**官方余额查询接口**，不会触发模型调用计费。
+- DeepSeek / SiliconFlow / 阿里云访问的都是**官方余额查询接口**，不会触发模型调用计费。自定义源只发 GET 查询，但仍取决于对方接口是否计费——请确认那是余额口而不是会走模型的路径。
 - API Key 和 AccessKey 保存在本地 `config.toml` 中，请确保该文件不会被意外泄露（不要 commit 到 git、不要发给别人）。
 - 若怀疑凭证泄漏，请立刻到对应平台后台**更换/撤销**该凭证；阿里云 AccessKey 可在 RAM 控制台禁用、删除或轮换。
 
@@ -153,5 +213,7 @@
 - **额度敏感**: 不要把 `/余额` 授权给整个群——虽然查询本身免费，但仍可能被恶意刷接口。
 - **请求超时**: 默认 10 秒；某家平台响应较慢可以把「请求超时（秒）」调高。卡片渲染的超时会自动钳在 25 秒以内（主程序渲染 RPC 的默认上限是 30 秒）。
 - **并发查询**: 多个管理员同时发 `/余额`（或同时在配置页点查询）时，插件只向各平台发起一轮请求，后到的直接复用这一轮的结果；权限检查仍由主程序对每条命令单独执行。
+- **自定义源没有余额接口就查不了**: 纯 OpenAI 兼容、只提供 `/v1/chat/completions` 的站点，没有账户查询口，`json` 协议也无能为力。请改用对方的用户信息 / 额度接口路径。
+- **New API 额度单位**: 默认按 `quota / 500000` 显示为美元。若你的站点改过换算比例，把「额度换算除数」改成站点配置值。
 
 Enjoy! 🎉

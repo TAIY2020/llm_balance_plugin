@@ -2,6 +2,9 @@
 
 通过聊天命令 `/余额` 并行查询 LLM 平台的账号余额，统一汇总输出。
 
+内置 DeepSeek / 硅基流动 / 阿里云；另提供 3 个自定义源槽位，协议为
+New API（One API）/ DeepSeek 风格 / 通用 JSON 字段映射。
+
 """
 
 import asyncio
@@ -59,7 +62,7 @@ PLUGIN_ID = _load_manifest_field("id", "TAIY2020.llm-balance-plugin")
 COMMAND_NAME = "llm_balance_query"
 # Host 命令管理里的命令 ID，额外授权（command_permissions）按它索引。
 COMMAND_ID = f"{PLUGIN_ID}.{COMMAND_NAME}"
-CONFIG_SCHEMA_VERSION = "1.5.0"
+CONFIG_SCHEMA_VERSION = "1.6.0"
 DEFAULT_TIMEOUT = 10  # 秒
 MAX_TIMEOUT = 60  # 秒，settings.timeout 的上限，须与 SettingsSection.timeout 的 le 保持一致
 # 单次响应体上限。余额接口的 JSON 只有几百字节，1 MiB 足够宽裕；超过说明端点被换成了
@@ -121,12 +124,45 @@ COMMAND_RPC_TIMEOUT_MS = int(
     + 30_000  # 发送与调度余量
 )
 
+NEWAPI_DEFAULT_PATH = "/api/user/self"
+# New API / One API 默认 500000 额度 = 1 美元；站点可改，故做成配置项。
+NEWAPI_DEFAULT_QUOTA_DIVISOR = Decimal("500000")
+NEWAPI_DEFAULT_CURRENCY = "USD"
+JSON_DEFAULT_CURRENCY = "CNY"
+NEWAPI_USER_HEADER = "New-Api-User"
+NEWAPI_USER_HEADER_ALT = "New-API-User"
+CUSTOM_PROTOCOL_NEWAPI = "newapi"
+CUSTOM_PROTOCOL_DEEPSEEK = "deepseek"
+CUSTOM_PROTOCOL_JSON = "json"
+CUSTOM_PROTOCOLS = (
+    CUSTOM_PROTOCOL_NEWAPI,
+    CUSTOM_PROTOCOL_DEEPSEEK,
+    CUSTOM_PROTOCOL_JSON,
+)
+CUSTOM_PROTOCOL_ALIASES = {
+    "oneapi": CUSTOM_PROTOCOL_NEWAPI,
+    "one-api": CUSTOM_PROTOCOL_NEWAPI,
+    "one_api": CUSTOM_PROTOCOL_NEWAPI,
+    "new-api": CUSTOM_PROTOCOL_NEWAPI,
+    "new_api": CUSTOM_PROTOCOL_NEWAPI,
+    "deep-seek": CUSTOM_PROTOCOL_DEEPSEEK,
+    "deep_seek": CUSTOM_PROTOCOL_DEEPSEEK,
+}
+
 # 配置节名 → 展示名，顺序即查询与展示顺序。
+# 自定义源做成顶层节而不是 List：WebUI 无法展开嵌套两层的 Pydantic Section。
+CUSTOM_SLOT_SECTIONS = (
+    ("custom_1", "自定义源 1"),
+    ("custom_2", "自定义源 2"),
+    ("custom_3", "自定义源 3"),
+)
 PROVIDER_SECTIONS = (
     ("deepseek", "DeepSeek"),
     ("siliconflow", "硅基流动"),
     ("aliyun", "阿里百炼"),
+    *CUSTOM_SLOT_SECTIONS,
 )
+CUSTOM_SLOT_KEYS = {key for key, _name in CUSTOM_SLOT_SECTIONS}
 
 # 配置页运行时控件。Host 对单次状态读取/按钮操作限时 8 秒，而一轮查询最坏要一两分钟，
 # 所以按钮只负责拉起后台查询，结果写进内存，由页面约 2 秒一次的轮询展示。
@@ -228,6 +264,74 @@ def _normalize_scoped_users(values: Any) -> set[str]:
         platform, _, user_id = text.partition(":")
         normalized.add(f"{platform.strip().lower()}:{user_id.strip()}")
     return normalized
+
+
+def _dig_json_path(payload: Any, path: str) -> Any:
+    """按点分路径取值，支持数字下标（如 ``data.items.0.quota``）。
+
+    空路径或中途对不上类型 / 越界时返回 None，由调用方决定如何展示。
+    """
+    text = (path or "").strip()
+    if not text:
+        return None
+    current = payload
+    for part in text.split("."):
+        if isinstance(current, Mapping):
+            if part not in current:
+                return None
+            current = current[part]
+            continue
+        if isinstance(current, Sequence) and not isinstance(current, (str, bytes, bytearray)):
+            if not part.isdigit():
+                return None
+            index = int(part)
+            if index < 0 or index >= len(current):
+                return None
+            current = current[index]
+            continue
+        return None
+    return current
+
+
+def _strip_trailing_path_suffixes(base_url: str, suffixes: Sequence[str]) -> str:
+    """去掉基地址 pathname 末尾的已知后缀（如 ``/v1``），保留子路径前缀。"""
+    parsed = urllib.parse.urlsplit((base_url or "").strip())
+    path = parsed.path.rstrip("/")
+    lowered = path.lower()
+    for suffix in suffixes:
+        if lowered.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _newapi_root_url(base_url: str) -> str:
+    """把用户常贴的 ``.../v1`` 或 ``.../api`` 基地址收成 New API 站点根。"""
+    return _strip_trailing_path_suffixes(base_url, ("/v1", "/api"))
+
+
+def _json_flag_is_false(value: Any) -> bool:
+    """判断业务成功标志是否明确为失败。None / 缺省不算失败。
+
+    不用数字 0 当失败：很多接口 ``code=0`` 表示成功。
+    """
+    if value is False:
+        return True
+    if isinstance(value, str) and value.strip().lower() in {"false", "fail", "failed", "error"}:
+        return True
+    return False
+
+
+def _normalize_request_path(path: str) -> str:
+    """把查询路径收成以 / 开头的相对路径，拒绝完整 URL。"""
+    text = (path or "").strip()
+    if not text:
+        return ""
+    if "://" in text or text.startswith("//"):
+        raise _BalanceConfigError("查询路径必须是 URL 路径（如 /api/user/self），不能是完整地址")
+    if not text.startswith("/"):
+        text = "/" + text
+    return text
 
 
 # --- 配置模型 ---
@@ -345,11 +449,156 @@ class AliyunProviderSection(PluginConfigBase):
     )
 
 
+class CustomProviderSection(PluginConfigBase):
+    """自定义余额源。协议决定默认路径与解析方式，JSON 路径可覆盖金额字段。"""
+
+    __ui_label__ = "自定义源"
+
+    enabled: bool = Field(default=False, json_schema_extra={"label": "启用此自定义源"})
+    name: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "显示名称",
+            "hint": "卡片和文本里显示的名字；留空则使用「自定义源 N」",
+        },
+    )
+    protocol: Literal["newapi", "deepseek", "json"] = Field(
+        default="newapi",
+        description="余额查询协议",
+        json_schema_extra={
+            "label": "协议",
+            "hint": "newapi=New API / One API（GET /api/user/self）；"
+                    "deepseek=DeepSeek /user/balance 风格；"
+                    "json=自行指定路径和 JSON 字段",
+        },
+    )
+    api_key: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "API Key / 访问令牌",
+            "x-widget": "password",
+            "hint": "New API / One API 请填「系统访问令牌」，不是模型调用用的 sk- Key",
+        },
+    )
+    base_url: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "API 基地址",
+            "hint": "必须是 HTTPS。New API 可填站点根或 .../v1（自动去掉末尾 /v1、/api）；"
+                    "deepseek 会去掉末尾 /v1",
+        },
+    )
+    path: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "查询路径（可选）",
+            "hint": "留空用协议默认：newapi=/api/user/self，deepseek=/user/balance；json 必须填写",
+        },
+    )
+    new_api_user: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "New-Api-User（可选）",
+            "hint": "部分 New API / One API 站点要求把用户 ID 放进此请求头，与访问令牌一起校验",
+        },
+    )
+    quota_divisor: float = Field(
+        default=0,
+        ge=0,
+        description="金额换算除数；0 表示按协议默认",
+        json_schema_extra={
+            "label": "额度换算除数",
+            "hint": "0=按协议默认。newapi 默认 500000（50 万额度=1 美元）；"
+                    "deepseek / json 默认不换算。填 1 表示不换算",
+        },
+    )
+    currency: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "展示币种（可选）",
+            "hint": "留空则 newapi=USD，deepseek=接口返回，json=CNY",
+        },
+    )
+    json_total: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "JSON 路径（主金额）",
+            "hint": "点分路径，如 data.quota。留空用协议默认；json 协议至少填一个金额路径。"
+                    "deepseek 协议忽略此项，固定解析 balance_infos",
+        },
+    )
+    json_granted: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "JSON 路径（第二金额）",
+            "hint": "newapi 默认 data.used_quota（已用额度）；json 可映射赠金等字段",
+        },
+    )
+    json_topped: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "JSON 路径（第三金额）",
+            "hint": "可选。newapi 默认不读第三项",
+        },
+    )
+    json_success: str = Field(
+        default="",
+        json_schema_extra={
+            "label": "JSON 路径（成功标志，可选）",
+            "hint": "如 success。值为 false/0 时按业务失败处理；留空则 newapi 仍检查根级 success",
+        },
+    )
+
+    @field_validator("protocol", mode="before")
+    @classmethod
+    def _coerce_protocol(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        text = value.strip().lower()
+        return CUSTOM_PROTOCOL_ALIASES.get(text, text)
+
+    @field_validator(
+        "name", "api_key", "base_url", "path", "new_api_user",
+        "currency", "json_total", "json_granted", "json_topped", "json_success",
+        mode="before",
+    )
+    @classmethod
+    def _strip_text(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("quota_divisor", mode="before")
+    @classmethod
+    def _coerce_quota_divisor(cls, value: Any) -> Any:
+        if value is None or value == "":
+            return 0
+        return value
+
+
+class Custom1ProviderSection(CustomProviderSection):
+    """自定义源 1。"""
+
+    __ui_label__ = "自定义源 1"
+
+
+class Custom2ProviderSection(CustomProviderSection):
+    """自定义源 2。"""
+
+    __ui_label__ = "自定义源 2"
+
+
+class Custom3ProviderSection(CustomProviderSection):
+    """自定义源 3。"""
+
+    __ui_label__ = "自定义源 3"
+
+
 class LLMBalanceConfig(PluginConfigBase):
     """插件完整配置。
 
-    deepseek / siliconflow 提升到顶层 Section，以便 WebUI 正确展开
-    （嵌套两层的 Pydantic Section WebUI 无法渲染，会显示成 [object Object]）。
+    deepseek / siliconflow / aliyun / 三个自定义源都提升到顶层 Section，以便 WebUI
+    正确展开（嵌套两层的 Pydantic Section WebUI 无法渲染，会显示成 [object Object]）。
     """
 
     plugin: PluginSection = Field(default_factory=PluginSection)
@@ -357,6 +606,9 @@ class LLMBalanceConfig(PluginConfigBase):
     deepseek: DeepSeekProviderSection = Field(default_factory=DeepSeekProviderSection)
     siliconflow: SiliconFlowProviderSection = Field(default_factory=SiliconFlowProviderSection)
     aliyun: AliyunProviderSection = Field(default_factory=AliyunProviderSection)
+    custom_1: Custom1ProviderSection = Field(default_factory=Custom1ProviderSection)
+    custom_2: Custom2ProviderSection = Field(default_factory=Custom2ProviderSection)
+    custom_3: Custom3ProviderSection = Field(default_factory=Custom3ProviderSection)
 
 
 # --- Provider 抽象 ---
@@ -486,6 +738,10 @@ class _BalanceProvider:
         """把原始响应转换为结构化 _BalanceRecord，由子类实现。"""
         raise NotImplementedError
 
+    def auth_error_hint(self) -> Optional[str]:
+        """401/403 时附加的配置提示；默认无。"""
+        return None
+
     @staticmethod
     def _format_amount(value: Any) -> Optional[str]:
         if value is None:
@@ -533,13 +789,17 @@ class _DeepSeekProvider(_BalanceProvider):
         return DEEPSEEK_DEFAULT_BASE_URL
 
     def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        return self.record_from_payload(self.display_name, payload)
+
+    @classmethod
+    def record_from_payload(cls, display_name: str, payload: Dict[str, Any]) -> _BalanceRecord:
         is_available = bool(payload.get("is_available", False))
         infos = payload.get("balance_infos") or []
         if not isinstance(infos, list):
             infos = []
 
         record = _BalanceRecord(
-            display_name=self.display_name,
+            display_name=display_name,
             status="正常" if is_available else "异常（余额不足或被限制）",
             status_ok=is_available,
         )
@@ -549,9 +809,9 @@ class _DeepSeekProvider(_BalanceProvider):
             currency = str(info.get("currency") or "?").upper()
             record.entries.append({
                 "currency": currency,
-                "total": self._format_amount(info.get("total_balance")),
-                "granted": self._format_amount(info.get("granted_balance")),
-                "topped": self._format_amount(info.get("topped_up_balance")),
+                "total": cls._format_amount(info.get("total_balance")),
+                "granted": cls._format_amount(info.get("granted_balance")),
+                "topped": cls._format_amount(info.get("topped_up_balance")),
             })
         if not record.entries:
             record.note = "未返回任何币种余额信息"
@@ -733,6 +993,190 @@ class _AliyunBssOpenApiProvider(_BalanceProvider):
         return urllib.parse.quote(str(value), safe="~")
 
 
+class _CustomProvider(_BalanceProvider):
+    """用户配置的自定义余额源：New API / DeepSeek 风格 / 通用 JSON。"""
+
+    def __init__(
+        self,
+        *,
+        display_name: str,
+        config_key: str,
+        protocol: str,
+        api_key: str,
+        base_url: str,
+        timeout: int,
+        path: str,
+        new_api_user: str,
+        quota_divisor: float,
+        currency: str,
+        json_total: str,
+        json_granted: str,
+        json_topped: str,
+        json_success: str,
+    ) -> None:
+        super().__init__(api_key=api_key, base_url=base_url, timeout=timeout)
+        self.display_name = display_name
+        self.config_key = config_key
+        self.protocol = protocol
+        self.custom_path = path
+        self.new_api_user = new_api_user
+        self.quota_divisor = quota_divisor
+        self.currency_override = currency
+        self.json_total = json_total
+        self.json_granted = json_granted
+        self.json_topped = json_topped
+        self.json_success = json_success
+
+    @property
+    def default_base_url(self) -> str:
+        return ""
+
+    def auth_error_hint(self) -> Optional[str]:
+        if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
+            return "New API / One API 请使用系统访问令牌，不是模型 API Key；若站点要求还需填写 New-Api-User"
+        return None
+
+    def _effective_root(self) -> str:
+        base = self._require_https_base_url()
+        if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
+            return _newapi_root_url(base)
+        if self.protocol == CUSTOM_PROTOCOL_DEEPSEEK:
+            # 聊天用基地址常带 /v1，官方余额口在站点根的 /user/balance。
+            return _strip_trailing_path_suffixes(base, ("/v1",))
+        return base
+
+    def _effective_path(self) -> str:
+        override = _normalize_request_path(self.custom_path)
+        if override:
+            return override
+        if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
+            return NEWAPI_DEFAULT_PATH
+        if self.protocol == CUSTOM_PROTOCOL_DEEPSEEK:
+            return DEEPSEEK_BALANCE_PATH
+        raise _BalanceConfigError(f"{self.display_name} 使用 json 协议时必须填写查询路径")
+
+    def _build_url(self) -> str:
+        return self._effective_root().rstrip("/") + self._effective_path()
+
+    def _request_headers(self) -> Dict[str, str]:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        user_id = self.new_api_user.strip()
+        if user_id:
+            headers[NEWAPI_USER_HEADER] = user_id
+            # 部分 One API 叉站用另一种大小写。
+            headers[NEWAPI_USER_HEADER_ALT] = user_id
+        return headers
+
+    def fetch_sync(self) -> Dict[str, Any]:
+        payload = self._request_json(self._build_url(), headers=self._request_headers())
+        self._raise_if_business_failure(payload)
+        return payload
+
+    def _raise_if_business_failure(self, payload: Dict[str, Any]) -> None:
+        flag: Any = None
+        if self.json_success:
+            flag = _dig_json_path(payload, self.json_success)
+        elif self.protocol in (CUSTOM_PROTOCOL_NEWAPI, CUSTOM_PROTOCOL_JSON):
+            flag = payload.get("success")
+        if _json_flag_is_false(flag):
+            message = str(
+                payload.get("message")
+                or payload.get("Message")
+                or _dig_json_path(payload, "data.message")
+                or "接口返回业务失败",
+            )
+            raise _BalanceBusinessError(message)
+
+    def _effective_divisor(self) -> Decimal:
+        if self.quota_divisor and self.quota_divisor > 0:
+            return Decimal(str(self.quota_divisor))
+        if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
+            return NEWAPI_DEFAULT_QUOTA_DIVISOR
+        return Decimal("1")
+
+    def _format_scaled(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            amount = Decimal(str(value).strip())
+            if not amount.is_finite():
+                return str(value)
+            divisor = self._effective_divisor()
+            if divisor != 1:
+                amount = amount / divisor
+            return format(amount.quantize(Decimal("0.01")), "f")
+        except (InvalidOperation, TypeError, ValueError, ArithmeticError):
+            return str(value)
+
+    def _effective_currency(self, fallback: str) -> str:
+        text = (self.currency_override or "").strip().upper()
+        return text or fallback
+
+    def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        if self.protocol == CUSTOM_PROTOCOL_DEEPSEEK:
+            record = _DeepSeekProvider.record_from_payload(self.display_name, payload)
+            if self.currency_override:
+                currency = self._effective_currency("CNY")
+                for entry in record.entries:
+                    entry["currency"] = currency
+            return record
+        if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
+            return self._record_newapi(payload)
+        return self._record_json(payload)
+
+    def _record_newapi(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        total = self._format_scaled(
+            _dig_json_path(payload, self.json_total) if self.json_total else _dig_json_path(payload, "data.quota"),
+        )
+        used = self._format_scaled(
+            _dig_json_path(payload, self.json_granted) if self.json_granted else _dig_json_path(payload, "data.used_quota"),
+        )
+        topped = self._format_scaled(
+            _dig_json_path(payload, self.json_topped) if self.json_topped else None,
+        )
+        if total is None and used is None and topped is None:
+            return _BalanceRecord(
+                self.display_name,
+                note="响应缺少 quota / used_quota，无法解析",
+                status_ok=False,
+            )
+        return _BalanceRecord(
+            display_name=self.display_name,
+            status="正常",
+            status_ok=True,
+            note="New API / One API 额度已按换算除数展示；与控制台美元/人民币口径可能不同",
+            entries=[{
+                "currency": self._effective_currency(NEWAPI_DEFAULT_CURRENCY),
+                "total": total,
+                "granted": used,
+                "topped": topped,
+                "labels": {"total": "可用额度", "granted": "已用额度", "topped": "附加金额"},
+            }],
+        )
+
+    def _record_json(self, payload: Dict[str, Any]) -> _BalanceRecord:
+        total = self._format_scaled(_dig_json_path(payload, self.json_total) if self.json_total else None)
+        granted = self._format_scaled(_dig_json_path(payload, self.json_granted) if self.json_granted else None)
+        topped = self._format_scaled(_dig_json_path(payload, self.json_topped) if self.json_topped else None)
+        if total is None and granted is None and topped is None:
+            return _BalanceRecord(
+                self.display_name,
+                note="未命中任何已配置的 JSON 金额字段",
+                status_ok=False,
+            )
+        return _BalanceRecord(
+            display_name=self.display_name,
+            status="正常",
+            status_ok=True,
+            entries=[{
+                "currency": self._effective_currency(JSON_DEFAULT_CURRENCY),
+                "total": total,
+                "granted": granted,
+                "topped": topped,
+            }],
+        )
+
+
 # --- 主插件类 ---
 
 class LLMBalancePlugin(MaiBotPlugin):
@@ -901,7 +1345,47 @@ class LLMBalancePlugin(MaiBotPlugin):
                 endpoint=section.endpoint.strip(),
                 timeout=timeout,
             ), None
+        if key in CUSTOM_SLOT_KEYS:
+            return self._build_custom_provider(key, timeout)
         raise ValueError(f"未知的平台配置节: {key}")
+
+    def _build_custom_provider(
+        self, key: str, timeout: int,
+    ) -> Tuple[Optional[_BalanceProvider], Optional[str]]:
+        """构造 custom_1 / custom_2 / custom_3。"""
+        section: CustomProviderSection = getattr(self.config, key)
+        slot_name = dict(CUSTOM_SLOT_SECTIONS)[key]
+        if not section.enabled:
+            return None, None
+        label = section.name.strip() or slot_name
+        api_key = section.api_key.strip()
+        base_url = section.base_url.strip()
+        protocol = section.protocol
+        if not api_key:
+            return None, f"{label}：已启用但未配置 API Key / 访问令牌"
+        if not base_url:
+            return None, f"{label}：已启用但未配置 API 基地址"
+        if protocol == CUSTOM_PROTOCOL_JSON:
+            if not section.path.strip():
+                return None, f"{label}：json 协议必须填写查询路径"
+            if not (section.json_total.strip() or section.json_granted.strip() or section.json_topped.strip()):
+                return None, f"{label}：json 协议必须至少填写一个 JSON 金额字段路径"
+        return _CustomProvider(
+            display_name=label,
+            config_key=key,
+            protocol=protocol,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            path=section.path,
+            new_api_user=section.new_api_user,
+            quota_divisor=section.quota_divisor,
+            currency=section.currency,
+            json_total=section.json_total,
+            json_granted=section.json_granted,
+            json_topped=section.json_topped,
+            json_success=section.json_success,
+        ), None
 
     def _collect_providers(self) -> Tuple[List[_BalanceProvider], List[str]]:
         """根据当前配置构造所有 enabled 平台的 Provider 实例。
@@ -1151,8 +1635,8 @@ class LLMBalancePlugin(MaiBotPlugin):
                 )
                 return False, "启用的平台凭证不完整", 1
             await self.ctx.send.text(
-                "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] / [aliyun] 段"
-                "设置 enabled=true 并填入对应凭证",
+                "❌ 未启用任何平台，请在配置文件 [deepseek] / [siliconflow] / [aliyun] "
+                "或 [custom_1] / [custom_2] / [custom_3] 段设置 enabled=true 并填入对应凭证",
                 stream_id,
             )
             return False, "无可用平台", 1
@@ -1304,6 +1788,9 @@ class LLMBalancePlugin(MaiBotPlugin):
         """识别异常类型并返回单行错误描述；非异常返回 None。"""
         if isinstance(item, _BalanceHTTPError):
             if item.status in (401, 403):
+                hint = provider.auth_error_hint()
+                if hint:
+                    return f"❌ API Key 无效或权限不足（{hint}）"
                 return "❌ API Key 无效或权限不足"
             return f"❌ HTTP {item.status}：{item.detail}"
         if isinstance(item, _BalanceBusinessError):
