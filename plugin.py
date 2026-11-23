@@ -68,6 +68,9 @@ MAX_TIMEOUT = 60  # 秒，settings.timeout 的上限，须与 SettingsSection.ti
 # 单次响应体上限。余额接口的 JSON 只有几百字节，1 MiB 足够宽裕；超过说明端点被换成了
 # 别的东西（网关错误页、被劫持），不该无限读下去占着线程。
 MAX_RESPONSE_BYTES = 1024 * 1024
+# 展示给用户的错误详情上限。详情取自对端响应体，长度不可控：不截断的话一条超长消息
+# 会原样进聊天，还会撑爆配置页状态文本的 2000 字上限。
+ERROR_DETAIL_MAX_CHARS = 200
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_BALANCE_PATH = "/user/balance"
@@ -108,8 +111,6 @@ OUTPUT_FORMATS = (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_IMAGE, OUTPUT_FORMAT_BOTH)
 MAX_FETCH_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.5
 RETRYABLE_HTTP_STATUSES = (429, 500, 502, 503, 504)
-# 插件实例级并发上限：跨命令共享，而不是每条 /余额 各开一份。
-DEFAULT_PROVIDER_CONCURRENCY = 3
 
 # html2png 业务超时上限。Host 侧 cap.call 的 RPC 默认超时是 30 秒，渲染业务超时若
 # 设得比它还长，RPC 会先超时抛错，渲染必然失败回退文本——所以这里钳在 30 秒以内。
@@ -130,15 +131,9 @@ NEWAPI_DEFAULT_QUOTA_DIVISOR = Decimal("500000")
 NEWAPI_DEFAULT_CURRENCY = "USD"
 JSON_DEFAULT_CURRENCY = "CNY"
 NEWAPI_USER_HEADER = "New-Api-User"
-NEWAPI_USER_HEADER_ALT = "New-API-User"
 CUSTOM_PROTOCOL_NEWAPI = "newapi"
 CUSTOM_PROTOCOL_DEEPSEEK = "deepseek"
 CUSTOM_PROTOCOL_JSON = "json"
-CUSTOM_PROTOCOLS = (
-    CUSTOM_PROTOCOL_NEWAPI,
-    CUSTOM_PROTOCOL_DEEPSEEK,
-    CUSTOM_PROTOCOL_JSON,
-)
 CUSTOM_PROTOCOL_ALIASES = {
     "oneapi": CUSTOM_PROTOCOL_NEWAPI,
     "one-api": CUSTOM_PROTOCOL_NEWAPI,
@@ -163,6 +158,11 @@ PROVIDER_SECTIONS = (
     *CUSTOM_SLOT_SECTIONS,
 )
 CUSTOM_SLOT_KEYS = {key for key, _name in CUSTOM_SLOT_SECTIONS}
+
+# 插件实例级并发上限：跨命令共享，而不是每条 /余额 各开一份。
+# 取平台总数，让一轮查询里所有平台同时发出：COMMAND_RPC_TIMEOUT_MS 是按"单平台最坏耗时"
+# 算的，并发小于平台数就得排第二轮，timeout 调高后整轮耗时会超过命令的 RPC 超时。
+DEFAULT_PROVIDER_CONCURRENCY = len(PROVIDER_SECTIONS)
 
 # 配置页运行时控件。Host 对单次状态读取/按钮操作限时 8 秒，而一轮查询最坏要一两分钟，
 # 所以按钮只负责拉起后台查询，结果写进内存，由页面约 2 秒一次的轮询展示。
@@ -200,7 +200,15 @@ _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 # --- 自定义异常 ---
 
 class _BalanceRequestError(RuntimeError):
-    """网络层异常（连接失败、超时、JSON 解析失败等）。"""
+    """网络层异常（连接失败、超时、读取中断等）。"""
+
+
+class _BalanceResponseError(_BalanceRequestError):
+    """响应内容异常（不是合法 JSON、顶层不是对象、超过体积上限）。
+
+    请求本身已经成功，重发只会拿到同样的内容，所以不参与重试；
+    展示与日志仍沿用网络层异常的口径。
+    """
 
 
 class _BalanceHTTPError(RuntimeError):
@@ -215,6 +223,9 @@ class _BalanceHTTPError(RuntimeError):
 class _BalanceBusinessError(RuntimeError):
     """业务层异常（接口返回 2xx 但 body 表示失败）。"""
 
+    def __init__(self, message: str) -> None:
+        super().__init__(str(message)[:ERROR_DETAIL_MAX_CHARS])
+
 
 class _BalanceConfigError(RuntimeError):
     """插件配置错误（如非 HTTPS API 地址）。"""
@@ -224,6 +235,8 @@ def _is_retryable_fetch_error(exc: Exception) -> bool:
     """判断一次余额查询失败是否适合短暂重试。"""
     if isinstance(exc, _BalanceHTTPError):
         return exc.status in RETRYABLE_HTTP_STATUSES
+    if isinstance(exc, _BalanceResponseError):
+        return False
     return isinstance(exc, _BalanceRequestError)
 
 
@@ -306,8 +319,10 @@ def _strip_trailing_path_suffixes(base_url: str, suffixes: Sequence[str]) -> str
 
 
 def _newapi_root_url(base_url: str) -> str:
-    """把用户常贴的 ``.../v1`` 或 ``.../api`` 基地址收成 New API 站点根。"""
-    return _strip_trailing_path_suffixes(base_url, ("/v1", "/api"))
+    """把用户常贴的 ``.../v1``、``.../api`` 或 ``.../api/v1`` 基地址收成 New API 站点根。"""
+    # 分两次剥：先 /v1 再 /api，否则 .../api/v1 只去掉一层，会拼出 /api/api/user/self。
+    without_version = _strip_trailing_path_suffixes(base_url, ("/v1",))
+    return _strip_trailing_path_suffixes(without_version, ("/api",))
 
 
 def _json_flag_is_false(value: Any) -> bool:
@@ -484,7 +499,7 @@ class CustomProviderSection(PluginConfigBase):
         default="",
         json_schema_extra={
             "label": "API 基地址",
-            "hint": "必须是 HTTPS。New API 可填站点根或 .../v1（自动去掉末尾 /v1、/api）；"
+            "hint": "必须是 HTTPS。New API 可填站点根或 .../v1（自动去掉末尾 /v1、/api、/api/v1）；"
                     "deepseek 会去掉末尾 /v1",
         },
     )
@@ -509,14 +524,15 @@ class CustomProviderSection(PluginConfigBase):
         json_schema_extra={
             "label": "额度换算除数",
             "hint": "0=按协议默认。newapi 默认 500000（50 万额度=1 美元）；"
-                    "deepseek / json 默认不换算。填 1 表示不换算",
+                    "json 默认不换算。填 1 表示不换算。deepseek 协议忽略此项，金额按接口返回原样展示",
         },
     )
     currency: str = Field(
         default="",
         json_schema_extra={
             "label": "展示币种（可选）",
-            "hint": "留空则 newapi=USD，deepseek=接口返回，json=CNY",
+            "hint": "留空则 newapi=USD，deepseek=接口返回，json=CNY。"
+                    "deepseek 协议返回多个币种时不覆盖，各条目沿用接口返回的币种",
         },
     )
     json_total: str = Field(
@@ -545,7 +561,8 @@ class CustomProviderSection(PluginConfigBase):
         default="",
         json_schema_extra={
             "label": "JSON 路径（成功标志，可选）",
-            "hint": "如 success。值为 false/0 时按业务失败处理；留空则 newapi 仍检查根级 success",
+            "hint": "如 success。值为 false（或字符串 false/fail/failed/error）时按业务失败处理，"
+                    "数字 0 不算失败；留空则 newapi / json 仍检查根级 success",
         },
     )
 
@@ -692,14 +709,14 @@ class _BalanceProvider:
             raise _BalanceRequestError(f"{type(exc).__name__}: {exc}")
 
         if len(raw) > MAX_RESPONSE_BYTES:
-            raise _BalanceRequestError(f"响应体超过 {MAX_RESPONSE_BYTES // 1024} KiB 上限，已放弃解析")
+            raise _BalanceResponseError(f"响应体超过 {MAX_RESPONSE_BYTES // 1024} KiB 上限，已放弃解析")
         body = raw.decode("utf-8", errors="replace")
         try:
             payload = json.loads(body)
         except ValueError as exc:
-            raise _BalanceRequestError(f"响应不是合法 JSON：{exc}")
+            raise _BalanceResponseError(f"响应不是合法 JSON：{exc}")
         if not isinstance(payload, dict):
-            raise _BalanceRequestError(f"响应 JSON 顶层不是对象，而是 {type(payload).__name__}")
+            raise _BalanceResponseError(f"响应 JSON 顶层不是对象，而是 {type(payload).__name__}")
         return payload
 
     def fetch_sync(self) -> Dict[str, Any]:
@@ -713,26 +730,26 @@ class _BalanceProvider:
         try:
             raw = exc.read(MAX_RESPONSE_BYTES).decode("utf-8", errors="replace")
         except (OSError, http.client.HTTPException):
-            return str(exc.reason or "未知错误")[:200]
+            return str(exc.reason or "未知错误")[:ERROR_DETAIL_MAX_CHARS]
         if not raw:
-            return str(exc.reason or "未知错误")[:200]
+            return str(exc.reason or "未知错误")[:ERROR_DETAIL_MAX_CHARS]
         try:
             parsed = json.loads(raw)
         except ValueError:
-            return raw[:200]
+            return raw[:ERROR_DETAIL_MAX_CHARS]
         if isinstance(parsed, dict):
             err = parsed.get("error")
             if isinstance(err, dict):
                 msg = str(err.get("message") or "")
                 if msg:
-                    return msg[:200]
+                    return msg[:ERROR_DETAIL_MAX_CHARS]
             # OpenAI 风格用小写 message；阿里云 OpenAPI 错误体是首字母大写的 Message，
             # 只查小写会让鉴权错误退化成截断的原始 JSON。
             msg = str(parsed.get("message") or parsed.get("Message") or "")
             if msg:
                 code = str(parsed.get("Code") or "").strip()
-                return (f"{code}: {msg}" if code else msg)[:200]
-        return raw[:200]
+                return (f"{code}: {msg}" if code else msg)[:ERROR_DETAIL_MAX_CHARS]
+        return raw[:ERROR_DETAIL_MAX_CHARS]
 
     def to_record(self, payload: Dict[str, Any]) -> "_BalanceRecord":
         """把原始响应转换为结构化 _BalanceRecord，由子类实现。"""
@@ -1062,9 +1079,9 @@ class _CustomProvider(_BalanceProvider):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         user_id = self.new_api_user.strip()
         if user_id:
+            # 只发一条：urllib 的 add_header 会把头名统一成 New-api-user，
+            # 换一种大小写再加一次只是覆盖同一个键；HTTP 头名本身不区分大小写。
             headers[NEWAPI_USER_HEADER] = user_id
-            # 部分 One API 叉站用另一种大小写。
-            headers[NEWAPI_USER_HEADER_ALT] = user_id
         return headers
 
     def fetch_sync(self) -> Dict[str, Any]:
@@ -1115,10 +1132,9 @@ class _CustomProvider(_BalanceProvider):
     def to_record(self, payload: Dict[str, Any]) -> _BalanceRecord:
         if self.protocol == CUSTOM_PROTOCOL_DEEPSEEK:
             record = _DeepSeekProvider.record_from_payload(self.display_name, payload)
-            if self.currency_override:
-                currency = self._effective_currency("CNY")
-                for entry in record.entries:
-                    entry["currency"] = currency
+            # 多币种响应靠币种区分各条目，全部改成同一个会变成几条同名余额，故只覆盖单条目。
+            if self.currency_override and len(record.entries) == 1:
+                record.entries[0]["currency"] = self._effective_currency("CNY")
             return record
         if self.protocol == CUSTOM_PROTOCOL_NEWAPI:
             return self._record_newapi(payload)
@@ -1538,7 +1554,7 @@ class LLMBalancePlugin(MaiBotPlugin):
     def _widget_state_for_item(cls, provider: _BalanceProvider, item: Any) -> ConfigWidgetState:
         error_line = cls._format_error_line(provider, item)
         if error_line is not None:
-            return ConfigWidgetState(text=error_line.removeprefix("❌ "), tone="error")
+            return ConfigWidgetState(text=error_line.removeprefix("❌ ")[:2000], tone="error")
         assert isinstance(item, _BalanceRecord)
         parts: List[str] = []
         if item.status:
@@ -1788,10 +1804,14 @@ class LLMBalancePlugin(MaiBotPlugin):
         """识别异常类型并返回单行错误描述；非异常返回 None。"""
         if isinstance(item, _BalanceHTTPError):
             if item.status in (401, 403):
+                line = "❌ API Key 无效或权限不足"
                 hint = provider.auth_error_hint()
                 if hint:
-                    return f"❌ API Key 无效或权限不足（{hint}）"
-                return "❌ API Key 无效或权限不足"
+                    line += f"（{hint}）"
+                # 带上服务端原话：阿里云 403 多半是 RAM 未授权或签名不匹配，只说"Key 无效"会排查错方向。
+                if item.detail:
+                    line += f"：{item.detail}"
+                return line
             return f"❌ HTTP {item.status}：{item.detail}"
         if isinstance(item, _BalanceBusinessError):
             return f"❌ 业务失败：{item}"
@@ -1899,6 +1919,7 @@ body {{
   margin-bottom: 12px;
   background: #fafbff;
 }}
+/* 各平台块单独包在 .providers 里：直接挂在 #card 下时最后一个子元素是 .footer，last-child 永远命中不了。 */
 .provider:last-child {{ margin-bottom: 0; }}
 .provider-head {{
   display: flex;
@@ -1972,7 +1993,7 @@ body {{
 <div id="card">
   <h1 class="card-title">💰 LLM 平台余额</h1>
   <p class="card-subtitle">共 {len(records)} 个平台</p>
-  {''.join(sections)}
+  <div class="providers">{''.join(sections)}</div>
   <div class="footer">MaiBot · LLM Balance Plugin v{PLUGIN_VERSION}</div>
 </div>
 </body></html>"""

@@ -4,9 +4,6 @@
 
 > 本版本基于 **MaiBot SDK v2** 开发，使用 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。**推荐通过 Web UI 修改配置**。
 
-> [!IMPORTANT]
-> **v1.7.0 起 `/余额` 改由主程序「命令管理」统一鉴权**，插件自己的「仅管理员可用 / 管理员列表」已弃用、不再生效。从旧版本升级时，请先把原来列表里的 QQ 号以 `qq:号码` 的格式加入主程序管理员（或在「命令管理」里给 `/余额` 单独授权），否则升级后只有 WebUI 本地控制台能查询。详见下方「权限配置」。
-
 ## ✨ 功能特性
 
 - **一条命令查所有平台**: `/余额` 同时去问已启用的平台，结果汇总成一条消息发出来。
@@ -107,15 +104,15 @@ Web UI 无法展开「列表套对象」的嵌套配置，因此自定义源做�
 | 显示名称（`name`） | `""` | 卡片和 `/余额` 文本里显示的名字；留空则为「自定义源 N」 |
 | 协议（`protocol`） | `"newapi"` | `newapi`（New API / One API）、`deepseek`（`/user/balance` 风格）、`json`（自定路径 + JSON 字段） |
 | API Key / 访问令牌（`api_key`） | `""` | **New API 请填系统访问令牌**，不是模型调用用的 `sk-` Key |
-| API 基地址（`base_url`） | `""` | 必须是 HTTPS。New API 可填站点根或 `.../v1`（去掉末尾 `/v1`、`/api`）；deepseek 会去掉末尾 `/v1` |
+| API 基地址（`base_url`） | `""` | 必须是 HTTPS。New API 可填站点根或 `.../v1`（去掉末尾 `/v1`、`/api`、`/api/v1`）；deepseek 会去掉末尾 `/v1` |
 | 查询路径（`path`） | `""` | 留空用协议默认：newapi=`/api/user/self`，deepseek=`/user/balance`；json **必须填写** |
-| New-Api-User（`new_api_user`） | `""` | 部分 New API 站点要求把用户 ID 放进请求头；填写后会同时发送 `New-Api-User` 和 `New-API-User` |
-| 额度换算除数（`quota_divisor`） | `0` | `0`=按协议默认。newapi 默认 `500000`（50 万额度 = 1 美元）；deepseek / json 默认不换算。填 `1` 表示不换算 |
-| 展示币种（`currency`） | `""` | 留空则 newapi=`USD`，deepseek=接口返回，json=`CNY` |
+| New-Api-User（`new_api_user`） | `""` | 部分 New API 站点要求把用户 ID 放进请求头；填写后会随请求发送 `New-Api-User` 头（HTTP 头名不区分大小写） |
+| 额度换算除数（`quota_divisor`） | `0` | `0`=按协议默认。newapi 默认 `500000`（50 万额度 = 1 美元）；json 默认不换算。填 `1` 表示不换算。**deepseek 协议忽略此项**，金额按接口返回原样展示 |
+| 展示币种（`currency`） | `""` | 留空则 newapi=`USD`，deepseek=接口返回，json=`CNY`。deepseek 协议返回多个币种时不覆盖，各条目沿用接口返回的币种 |
 | JSON 路径（主金额）（`json_total`） | `""` | 点分路径，如 `data.quota`。newapi 默认 `data.quota`；json 至少填一个金额路径。**deepseek 协议忽略 JSON 路径**，固定解析 `balance_infos` |
 | JSON 路径（第二金额）（`json_granted`） | `""` | newapi 默认 `data.used_quota`（已用额度） |
 | JSON 路径（第三金额）（`json_topped`） | `""` | 可选附加金额 |
-| JSON 路径（成功标志）（`json_success`） | `""` | 如 `success`。值为 false/0 时按业务失败处理；留空时 newapi / json 仍检查根级 `success` |
+| JSON 路径（成功标志）（`json_success`） | `""` | 如 `success`。值为 `false`（或字符串 `false` / `fail` / `failed` / `error`）时按业务失败处理；数字 `0` 不算失败（很多接口用 `code=0` 表示成功）。留空时 newapi / json 仍检查根级 `success` |
 
 协议对照：
 
